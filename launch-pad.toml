@@ -1,0 +1,21 @@
+# Sketch Lab — static site on Launch Pad
+# Deploy: lpd deploy (from this directory)
+project = "sketchlab"
+domainPattern = "{env}.sketchlab.webdevcody.com"
+
+[[service]]
+name = "web"
+dockerfile = "./Dockerfile"
+cpu = 128
+memory = 32
+replicas = 1
+domain = "sketchlab.webdevcody.com" # change to your domain
+port = 80
+
+  [service.healthCheck]
+  path = "/"
+
+  [service.rollout]
+  maxSurge = 1
+  drainTimeout = "10s"
+  stopGrace = "15s"
