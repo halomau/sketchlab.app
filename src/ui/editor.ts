@@ -1,14 +1,23 @@
 import { centerOrigin, fitToContent, getZoom, zoomBy } from "../interaction/camera";
+import { generateDiagramWithOpenAI } from "../ai/openaiDiagram";
 import { Controller } from "../interaction/controller";
 import { NO_FILL } from "../render/geometry";
 import { saveNow, startAutosave, stopAutosave } from "../persistence/autosave";
-import { saveBoard } from "../persistence/db";
+import { listBoards, saveBoard } from "../persistence/db";
 import { shareUrl } from "../persistence/share";
 import { scene } from "../render/scene";
 import * as actions from "../state/actions";
 import { $canRedo, $canUndo, disposeHistory, initHistory, redo, undo } from "../state/history";
-import { $camera, $selection, $style, $tool, doc } from "../state/store";
-import type { Board, Camera, ToolName } from "../state/types";
+import { $activeLayer, $camera, $selection, $style, $tool, doc } from "../state/store";
+import { TEXT_SIZE_PRESETS } from "../state/style";
+import type { Board, ToolName } from "../state/types";
+import { generatedGraphToBoard } from "../state/generatedGraph";
+import { createStarterBoard } from "../state/starterBoard";
+import { emptyBoard } from "../state/store";
+import { BoardDrawer } from "./boardDrawer";
+import { ControlsHelp } from "./controlsHelp";
+import { LayersPanel } from "./layersPanel";
+import { AIGeneratePanel } from "./aiGeneratePanel";
 import { clear, h, toast } from "./dom";
 import { navigate } from "./nav";
 import { createSwatchPicker } from "./swatchPicker";
@@ -33,6 +42,21 @@ const GITHUB_ICON =
 
 const ICON_SPARKLE = svg(
   '<path d="M12 3l1.7 4.8L18.5 9.5 13.7 11.2 12 16l-1.7-4.8L5.5 9.5l4.8-1.7z" fill="currentColor" stroke="none"/><path d="M18 15l.7 1.9 1.9.7-1.9.7-.7 1.9-.7-1.9-1.9-.7 1.9-.7z" fill="currentColor" stroke="none"/>',
+);
+const ICON_MAGIC_WAND = svg(
+  '<path d="M4 20 20 4"/><path d="m14 4 6 6"/><path d="M6 4l.7 1.8L8.5 6.5 6.7 7.2 6 9l-.7-1.8-1.8-.7 1.8-.7z" fill="currentColor" stroke="none"/><path d="M18 15l.6 1.5 1.4.5-1.4.5L18 20l-.6-1.5-1.4-.5 1.4-.5z" fill="currentColor" stroke="none"/>',
+);
+const ICON_MENU = svg(
+  '<path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h16"/>',
+);
+const ICON_AUTO_LAYOUT = svg(
+  '<rect x="4" y="5" width="5" height="4" rx="1"/><rect x="15" y="5" width="5" height="4" rx="1"/><rect x="9.5" y="15" width="5" height="4" rx="1"/><path d="M6.5 9v2.5h5.5V15"/><path d="M17.5 9v2.5H12V15"/>',
+);
+const ICON_LAYERS = svg(
+  '<path d="M12 3 21 8l-9 5-9-5z"/><path d="M3 13l9 5 9-5"/><path d="M3 17l9 5 9-5"/>',
+);
+const ICON_HELP = svg(
+  '<circle cx="12" cy="12" r="9"/><path d="M9.4 9a2.6 2.6 0 0 1 4.6 1.5c0 1.7-2.4 2-2.4 3.7"/><path d="M12 17h.01"/>',
 );
 
 const TOOLS: Array<{ tool: ToolName; icon: string; key: string; title: string }> = [
@@ -69,13 +93,7 @@ export async function mountEditor(
   const unsubs: Array<() => void> = [];
   let shared = !!opts.shared;
 
-  // --- background grid follows the camera ---
-  const applyGrid = (cam: Camera) => {
-    const size = 24 * cam.zoom;
-    host.style.backgroundSize = `${size}px ${size}px`;
-    host.style.backgroundPosition = `${cam.x}px ${cam.y}px`;
-  };
-  unsubs.push($camera.subscribe(applyGrid));
+  // the floor grid is now drawn in perspective by the Pixi scene (no flat CSS grid)
 
   const onResize = () => scene.resize(host.clientWidth, host.clientHeight);
   window.addEventListener("resize", onResize);
@@ -89,17 +107,69 @@ export async function mountEditor(
       actions.renameBoard((e.target as HTMLInputElement).value.trim() || "Untitled"),
   });
 
-  const backBtn = h(
+  const switchBoard = (id: string) => {
+    if (!shared) void saveNow().finally(() => navigate(`#/board/${id}`));
+    else navigate(`#/board/${id}`);
+  };
+
+  const createBoard = async () => {
+    if (!shared) await saveNow();
+    const next = emptyBoard("Untitled board");
+    await saveBoard(next);
+    navigate(`#/board/${next.id}`);
+  };
+
+  let menuBtn!: HTMLButtonElement;
+
+  const boardDrawer = new BoardDrawer(editor, {
+    activeBoardId: board.id,
+    onSelect: switchBoard,
+    onCreate: () => void createBoard(),
+    onDeleted: async (deletedId) => {
+      if (deletedId !== doc.board.id) return;
+      const boards = await listBoards();
+      if (boards.length > 0) {
+        switchBoard(boards[0].id);
+        return;
+      }
+      const starter = createStarterBoard();
+      await saveBoard(starter);
+      navigate(`#/board/${starter.id}`);
+    },
+    onOpenChange: (open) => menuBtn.setAttribute("aria-expanded", String(open)),
+  });
+
+  menuBtn = h(
     "button",
     {
-      class: "btn",
-      onclick: () => {
-        if (!shared) saveNow().finally(() => navigate("#/"));
-        else navigate("#/");
-      },
+      class: "btn btn--icon topbar__menu",
+      title: "Boards",
+      "aria-label": "Boards",
+      "aria-expanded": "false",
+      html: ICON_MENU,
+      onclick: () => boardDrawer.toggle(),
     },
-    "← Boards",
   );
+
+  let layersBtn!: HTMLButtonElement;
+  const layersPanel = new LayersPanel(editor, {
+    onCollapseChange: (collapsed) => layersBtn?.setAttribute("aria-expanded", String(!collapsed)),
+  });
+  unsubs.push(
+    $activeLayer.subscribe((i) => {
+      scene.setActiveLayer(i);
+      actions.pruneSelectionToLayer(i); // off-floor nodes can't stay selected
+    }),
+  );
+
+  layersBtn = h("button", {
+    class: "btn btn--icon",
+    title: "Show / hide the Layers panel",
+    "aria-label": "Toggle layers panel",
+    "aria-expanded": "true",
+    html: ICON_LAYERS,
+    onclick: () => layersPanel.toggle(),
+  });
 
   const shareBtn = h(
     "button",
@@ -119,6 +189,56 @@ export async function mountEditor(
     },
     "Share",
   );
+
+  const hasBoardContent = () =>
+    Object.keys(doc.board.shapes).length > 0 || Object.keys(doc.board.edges).length > 0;
+
+  const aiPanel = new AIGeneratePanel(editor, async ({ apiKey, prompt, mode, signal }) => {
+    if (mode === "generate" && hasBoardContent() && !confirm("Replace the current board with a generated diagram?")) {
+      return false;
+    }
+    const graph = await generateDiagramWithOpenAI({
+      apiKey,
+      prompt,
+      mode,
+      currentBoard: mode === "modify" ? doc.board : undefined,
+      signal,
+    });
+    const generated = generatedGraphToBoard(graph, doc.board.name);
+    actions.replaceBoardContent({
+      name: generated.name,
+      shapes: generated.shapes,
+      edges: generated.edges,
+      order: generated.order,
+    });
+    nameInput.value = doc.board.name;
+    fitToContent();
+    toast(`${mode === "modify" ? "Modified" : "Generated"} ${Object.keys(generated.shapes).length} shapes`);
+    return true;
+  });
+
+  const aiBtn = h(
+    "button",
+    {
+      class: "btn btn--icon",
+      title: "Generate or modify with AI",
+      "aria-label": "Generate or modify with AI",
+      html: ICON_MAGIC_WAND,
+      onclick: () => aiPanel.open(aiBtn, { canModify: hasBoardContent() }),
+    },
+  );
+
+  const autoLayoutBtn = h("button", {
+    class: "btn btn--icon",
+    title: "Auto layout",
+    "aria-label": "Auto layout",
+    html: ICON_AUTO_LAYOUT,
+    onclick: () => {
+      const changed = actions.autoLayoutBoard();
+      fitToContent();
+      toast(changed ? "Auto layout applied" : "Board is already laid out");
+    },
+  });
 
   const banner = h(
     "div",
@@ -168,17 +288,21 @@ export async function mountEditor(
     html: GITHUB_ICON,
   });
 
-  const topbar = h(
-    "header",
-    { class: "topbar" },
-    backBtn,
+  const topbarSlide = h(
+    "div",
+    { class: "topbar__slide" },
     h("div", { class: "topbar__group" }, undoBtn, redoBtn),
     nameInput,
     h("div", { class: "topbar__spacer" }),
     saveCopyBtn,
+    aiBtn,
+    autoLayoutBtn,
+    layersBtn,
     githubLink,
     shareBtn,
   );
+
+  const topbar = h("header", { class: "topbar" }, menuBtn, topbarSlide);
 
   // ---- tool rail ----
   const toolbar = h("div", { class: "toolbar" });
@@ -203,6 +327,7 @@ export async function mountEditor(
   );
 
   // ---- zoom bar ----
+  const controlsHelp = new ControlsHelp(editor);
   const zoomLabel = h("span", { class: "zoombar__label" }, "100%");
   unsubs.push($camera.subscribe(() => (zoomLabel.textContent = `${Math.round(getZoom() * 100)}%`)));
   const zoombar = h(
@@ -212,6 +337,17 @@ export async function mountEditor(
     zoomLabel,
     h("button", { class: "btn btn--icon", title: "Zoom in", onclick: () => zoomBy(1.2) }, "+"),
     h("button", { class: "btn", title: "Fit to content", onclick: () => fitToContent() }, "Fit"),
+    h("div", { class: "zoombar__sep" }),
+    h(
+      "button",
+      {
+        class: "btn btn--icon",
+        title: "Controls & shortcuts (?)",
+        "aria-label": "Controls and shortcuts",
+        html: ICON_HELP,
+        onclick: () => controlsHelp.toggle(),
+      },
+    ),
   );
 
   // ---- style panel ----
@@ -225,16 +361,28 @@ export async function mountEditor(
       if (sel.shapes.size) actions.setShapesStyle(sel.shapes, { fill: color });
     },
   });
-  const strokePicker = createSwatchPicker({
-    title: "Outline / line color",
-    initial: $style.get().stroke,
-    onPick: (color) => {
-      $style.set({ ...$style.get(), stroke: color });
-      const sel = $selection.get();
-      if (sel.shapes.size) actions.setShapesStyle(sel.shapes, { stroke: color });
-      for (const id of sel.edges) actions.updateEdge(id, { stroke: color });
-    },
-  });
+
+  // text-size presets: apply a global font size to every existing label/text and
+  // remember it as the default for new text and edge labels.
+  const sizeButtons = TEXT_SIZE_PRESETS.map((preset) =>
+    h(
+      "button",
+      {
+        class: "size-btn",
+        title: `Text size ${preset.label} (${preset.size}px)`,
+        "aria-label": `Text size ${preset.label} (${preset.size}px)`,
+        "aria-pressed": "false",
+        onclick: () => {
+          $style.set({ ...$style.get(), fontSize: preset.size });
+          actions.setShapesFontSize(Object.keys(doc.board.shapes), preset.size);
+          actions.setEdgesFontSize(Object.keys(doc.board.edges), preset.size);
+          syncStyle();
+        },
+      },
+      preset.label,
+    ),
+  );
+  const sizePicker = h("div", { class: "size-picker" }, ...sizeButtons);
 
   const deleteBtn = h(
     "button",
@@ -246,24 +394,25 @@ export async function mountEditor(
     "div",
     { class: "style-panel" },
     h("div", { class: "field" }, h("span", null, "Fill"), fillPicker.el),
-    h("div", { class: "field" }, h("span", null, "Outline"), strokePicker.el),
+    h("div", { class: "field" }, h("span", null, "Size"), sizePicker),
     deleteBtn,
   );
 
   const syncStyle = () => {
     const sel = $selection.get();
     const firstShape = [...sel.shapes].map((id) => doc.board.shapes[id]).find(Boolean);
-    const firstEdge = [...sel.edges].map((id) => doc.board.edges[id]).find(Boolean);
     if (firstShape) {
       if (HEX.test(firstShape.fill) || firstShape.fill === NO_FILL)
         fillPicker.setValue(firstShape.fill);
-      if (HEX.test(firstShape.stroke)) strokePicker.setValue(firstShape.stroke);
     } else {
-      const st = $style.get();
-      fillPicker.setValue(st.fill);
-      strokePicker.setValue(st.stroke);
+      fillPicker.setValue($style.get().fill);
     }
-    if (firstEdge && HEX.test(firstEdge.stroke)) strokePicker.setValue(firstEdge.stroke);
+    const activeSize = $style.get().fontSize;
+    sizeButtons.forEach((btn, i) => {
+      const active = TEXT_SIZE_PRESETS[i].size === activeSize;
+      btn.classList.toggle("is-active", active);
+      btn.setAttribute("aria-pressed", String(active));
+    });
     const hasSel = sel.shapes.size > 0 || sel.edges.size > 0;
     deleteBtn.toggleAttribute("disabled", !hasSel);
     stylePanel.classList.toggle("style-panel--editing", hasSel);
@@ -271,13 +420,8 @@ export async function mountEditor(
   unsubs.push($selection.subscribe(syncStyle));
 
   editor.append(topbar, banner, toolbar, zoombar, stylePanel);
-
-  const hint = h(
-    "div",
-    { class: "hint" },
-    "Double-click to add text · / for icons · drop an image · scroll to pan · ⌘/Ctrl+scroll to zoom",
-  );
-  editor.appendChild(hint);
+  // cool cyan key-light bloom + corner vignette to seat the tabletop (topmost, no input)
+  editor.appendChild(h("div", { class: "tabletop-vignette" }));
 
   if (!shared) startAutosave();
 
@@ -285,6 +429,10 @@ export async function mountEditor(
     destroy() {
       unsubs.forEach((u) => u());
       window.removeEventListener("resize", onResize);
+      boardDrawer.destroy();
+      layersPanel.destroy();
+      aiPanel.destroy();
+      controlsHelp.destroy();
       controller.destroy();
       disposeHistory();
       stopAutosave();

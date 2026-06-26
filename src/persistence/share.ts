@@ -1,12 +1,14 @@
 import LZString from "lz-string";
 import { uid } from "../util";
-import type { Board, Edge, ID, Shape } from "../state/types";
+import type { Board, Edge, ID, LayerDef, Shape } from "../state/types";
 
 interface SharePayload {
   n: string;
   s: Record<ID, Shape>;
   e: Record<ID, Edge>;
   o: ID[];
+  /** named floors (optional; absent in pre-feature share links) */
+  l?: LayerDef[];
 }
 
 export function encodeBoard(board: Board): string {
@@ -15,6 +17,7 @@ export function encodeBoard(board: Board): string {
     s: board.shapes,
     e: board.edges,
     o: board.order,
+    l: board.layers,
   };
   return LZString.compressToEncodedURIComponent(JSON.stringify(payload));
 }
@@ -32,6 +35,7 @@ export function decodeBoard(code: string): Board | null {
       shapes,
       edges: p.e ?? {},
       order: p.o ?? Object.keys(shapes),
+      layers: p.l ?? [],
       createdAt: now,
       updatedAt: now,
     };

@@ -9,11 +9,17 @@ export interface TextEditOptions {
   fontSize: number;
   /** match the rendered text weight (e.g. "500", "600") */
   fontWeight?: string;
+  /** letter spacing in px, when the rendered label uses tracking */
+  letterSpacing?: number;
   /** line height in px (already scaled for zoom), to match the rendered text */
   lineHeight?: number;
   align?: "left" | "center";
   /** grow with content instead of using a fixed width (text objects) */
   autoGrow?: boolean;
+  /** keep text on its committed lines instead of browser-wrapping long labels */
+  noWrap?: boolean;
+  /** treat x as the horizontal center of the editor instead of its left edge */
+  centerX?: boolean;
   padding?: number;
   /** strip the border/background/shadow so editing looks like the plain text itself */
   chromeless?: boolean;
@@ -51,7 +57,9 @@ export class TextEditor {
       fontSize: `${opts.fontSize}px`,
       textAlign: opts.align ?? "center",
     });
+    if (opts.centerX) el.style.transform = "translateX(-50%)";
     if (opts.fontWeight != null) el.style.fontWeight = opts.fontWeight;
+    if (opts.letterSpacing != null) el.style.letterSpacing = `${opts.letterSpacing}px`;
     if (opts.lineHeight != null) el.style.lineHeight = `${opts.lineHeight}px`;
     if (opts.padding != null) el.style.padding = `${opts.padding}px`;
     if (opts.chromeless) {
@@ -63,10 +71,17 @@ export class TextEditor {
     if (opts.autoGrow) {
       el.style.display = "block";
       el.style.whiteSpace = "pre";
-      el.style.width = "auto";
-      el.style.minWidth = "8px";
+      el.style.wordBreak = "normal";
+      el.style.overflow = "visible";
+      el.style.width = "max-content";
+      el.style.minWidth = `${Math.max(8, opts.w)}px`;
     } else {
       el.style.width = `${opts.w}px`;
+      if (opts.noWrap) {
+        el.style.whiteSpace = "pre";
+        el.style.wordBreak = "normal";
+        el.style.overflow = "visible";
+      }
     }
     el.addEventListener("input", () => this.opts?.onInput(el.textContent ?? ""));
     el.addEventListener("keydown", (e) => {

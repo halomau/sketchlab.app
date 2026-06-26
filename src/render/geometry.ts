@@ -15,13 +15,13 @@ export function boundaryPoint(s: Shape, target: Pt): Pt {
   const dx = target.x - c.x;
   const dy = target.y - c.y;
   if (dx === 0 && dy === 0) return c;
-  if (s.kind === "circle") {
-    const rx = s.w / 2;
-    const ry = s.h / 2;
-    const t = 1 / Math.sqrt((dx * dx) / (rx * rx) + (dy * dy) / (ry * ry));
-    return { x: c.x + dx * t, y: c.y + dy * t };
+  // circle/icon render as a disc, so anchor edges to that circular rim
+  if (s.kind === "circle" || s.kind === "icon") {
+    const r = Math.min(s.w, s.h) / 2;
+    const len = Math.hypot(dx, dy) || 1;
+    return { x: c.x + (dx / len) * r, y: c.y + (dy / len) * r };
   }
-  // rect / icon: intersect ray with the half-extent box
+  // rect / image / text: intersect ray with the half-extent box
   const hw = s.w / 2;
   const hh = s.h / 2;
   const tx = dx !== 0 ? hw / Math.abs(dx) : Infinity;
@@ -202,7 +202,7 @@ export function resolveEdgeGeometry(
   };
 }
 
-/** Sentinel `fill`/`stroke` value meaning "no paint" — the shape renders as outline only. */
+/** Sentinel `fill` value meaning "no paint" — the shape renders with a transparent body. */
 export const NO_FILL = "transparent";
 
 export function hexToNumber(hex: string): number {

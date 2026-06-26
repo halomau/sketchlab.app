@@ -1,7 +1,8 @@
 import "./styles.css";
-import { loadBoardById } from "./persistence/db";
+import { loadBoardById, listBoards, saveBoard } from "./persistence/db";
 import { decodeBoard } from "./persistence/share";
-import { mountDashboard } from "./ui/dashboard";
+import { createStarterBoard } from "./state/starterBoard";
+import type { Board } from "./state/types";
 import { mountEditor, type MountedView } from "./ui/editor";
 
 const app = document.getElementById("app") as HTMLElement;
@@ -9,6 +10,33 @@ const app = document.getElementById("app") as HTMLElement;
 let current: MountedView | null = null;
 let rendering = false;
 let pendingRerender = false;
+
+async function resolveBoard(): Promise<{ board: Board; shared?: boolean }> {
+  const url = new URL(location.href);
+  const sharedCode = url.searchParams.get("b");
+  if (sharedCode) {
+    const board = decodeBoard(sharedCode);
+    history.replaceState(null, "", location.pathname + (location.hash || "#/"));
+    if (board) return { board, shared: true };
+  }
+
+  const hash = location.hash.replace(/^#/, "");
+  const match = hash.match(/^\/board\/(.+)$/);
+  if (match) {
+    const board = await loadBoardById(decodeURIComponent(match[1]));
+    if (board) return { board };
+  }
+
+  const boards = await listBoards();
+  if (boards.length > 0) {
+    const board = await loadBoardById(boards[0].id);
+    if (board) return { board };
+  }
+
+  const starter = createStarterBoard();
+  await saveBoard(starter);
+  return { board: starter };
+}
 
 async function render(): Promise<void> {
   if (rendering) {
@@ -23,31 +51,12 @@ async function render(): Promise<void> {
   }
 
   try {
-    const url = new URL(location.href);
-    const sharedCode = url.searchParams.get("b");
-    if (sharedCode) {
-      const board = decodeBoard(sharedCode);
-      // strip the (huge) query string but keep the route
-      history.replaceState(null, "", location.pathname + (location.hash || "#/"));
-      if (board) {
-        current = await mountEditor(app, board, { shared: true });
-        return;
-      }
+    const { board, shared } = await resolveBoard();
+    const targetHash = `#/board/${board.id}`;
+    if (!shared && location.hash !== targetHash) {
+      history.replaceState(null, "", targetHash);
     }
-
-    const hash = location.hash.replace(/^#/, "");
-    const match = hash.match(/^\/board\/(.+)$/);
-    if (match) {
-      const board = await loadBoardById(decodeURIComponent(match[1]));
-      if (board) {
-        current = await mountEditor(app, board, {});
-        return;
-      }
-      location.hash = "#/";
-      return;
-    }
-
-    current = await mountDashboard(app);
+    current = await mountEditor(app, board, { shared: !!shared });
   } finally {
     rendering = false;
     if (pendingRerender) {

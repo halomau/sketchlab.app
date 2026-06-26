@@ -11,7 +11,6 @@ export interface Shape {
   w: number;
   h: number;
   fill: string;
-  stroke: string;
   text: string;
   /** only for kind === "icon": registry key of the icon to draw */
   icon?: string;
@@ -19,6 +18,25 @@ export interface Shape {
   src?: string;
   /** label/text font size in world units; scales with the object on resize (defaults per kind) */
   fontSize?: number;
+  /**
+   * Stacking layer for 3D depth ordering. Higher = nearer the viewer (rises off
+   * the board, drawn on top / "front"); lower = farther (sinks below, "back").
+   * Rendered as a world-up elevation (layer * FLOOR_STEP). Defaults to 0.
+   *
+   * Also the 0-based index into `Board.layers` — i.e. the named FLOOR this shape
+   * sits on. Each distinct value draws as its own glowing board plane.
+   */
+  layer?: number;
+}
+
+/** A named, rendered floor in the 3D stack. Index in Board.layers === Shape.layer. */
+export interface LayerDef {
+  id: ID;
+  name: string;
+  /** optional accent used for this floor's frame + pill (defaults to cyan) */
+  color?: string;
+  /** when true, the floor (its frame, tokens, edges & badge) is not drawn or hit-tested */
+  hidden?: boolean;
 }
 
 export interface Edge {
@@ -33,8 +51,9 @@ export interface Edge {
   /** world-space position of a free `to` end (used when `to` is undefined) */
   x2?: number;
   y2?: number;
-  stroke: string;
   label: string;
+  /** edge label font size in world units; follows the same S/M/L presets as shapes */
+  fontSize?: number;
   /** when true, draw an arrowhead at the `to` end (directed edge) */
   directed?: boolean;
   /**
@@ -44,6 +63,14 @@ export interface Edge {
    */
   cx?: number;
   cy?: number;
+  /**
+   * Floor this edge floats on while it has a free (unanchored) end — mirrors
+   * `Shape.layer` and is the 0-based index into `Board.layers`. A free end lifts
+   * to this floor's elevation instead of dropping to the ground, so an arrow
+   * drawn on the active floor stays on it. Anchored ends ignore this and ride
+   * their shape's floor. Defaults to 0 (ground).
+   */
+  layer?: number;
 }
 
 export interface Board {
@@ -53,6 +80,8 @@ export interface Board {
   edges: Record<ID, Edge>;
   /** unified paint order (bottom -> top) of shape AND edge ids */
   order: ID[];
+  /** Ordered named floors (bottom→top). Optional for back-compat; index === Shape.layer. */
+  layers?: LayerDef[];
   createdAt: number;
   updatedAt: number;
 }
@@ -75,9 +104,28 @@ export type ToolName =
   | "hand";
 
 export interface Camera {
-  x: number;
-  y: number;
+  /** ground point (board coords) under the screen center — PAN moves this */
+  focusX: number;
+  focusY: number;
+  /** focal multiplier; clamped MIN_ZOOM..MAX_ZOOM (same hand-feel as old zoom) */
   zoom: number;
+  /** optical-axis angle below horizontal, radians. π/2 = top-down; default π/3 */
+  pitch: number;
+  /** eye-to-focus distance in world units; default 1200 */
+  distance: number;
+  /**
+   * Screen-space offset (px) of the principal point from the viewport center.
+   * Zoom leaves this unchanged so magnification is independent of cursor location.
+   * Default 0.
+   */
+  panX: number;
+  panY: number;
+  /**
+   * Turntable yaw: rotation (radians) of the board around the vertical axis
+   * through the focus/center origin. Spins the board within its own ground
+   * plane — it stays flat and level (pitch is unchanged). Default 0.
+   */
+  yaw: number;
 }
 
 export interface SelectionState {

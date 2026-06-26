@@ -1,3 +1,5 @@
+import { DEFAULT_TEXT_FONT_SIZE } from "../state/style";
+
 const FONT = "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
 
 let ctx: CanvasRenderingContext2D | null = null;
@@ -6,7 +8,7 @@ function context(): CanvasRenderingContext2D | null {
   return ctx;
 }
 
-export const TEXT_FONT_SIZE = 20;
+export const TEXT_FONT_SIZE = DEFAULT_TEXT_FONT_SIZE;
 export const TEXT_PAD = 10;
 const LINE_RATIO = 1.3;
 

@@ -1,5 +1,7 @@
 import { atom } from "nanostores";
+import { FLOOR_STEP } from "../render/shading";
 import { uid } from "../util";
+import { DEFAULT_TEXT_FONT_SIZE } from "./style";
 import type { Board, Camera, SelectionState, ToolName } from "./types";
 
 export function emptyBoard(name = "Untitled"): Board {
@@ -10,6 +12,7 @@ export function emptyBoard(name = "Untitled"): Board {
     shapes: {},
     edges: {},
     order: [],
+    layers: [],
     createdAt: now,
     updatedAt: now,
   };
@@ -19,7 +22,16 @@ export function emptyBoard(name = "Untitled"): Board {
 export const doc: { board: Board } = { board: emptyBoard() };
 
 export const $tool = atom<ToolName>("select");
-export const $camera = atom<Camera>({ x: 0, y: 0, zoom: 1 });
+export const $camera = atom<Camera>({
+  focusX: 0,
+  focusY: 0,
+  zoom: 1,
+  pitch: Math.PI / 3,
+  distance: 1200,
+  panX: 0,
+  panY: 0,
+  yaw: 0,
+});
 export const $selection = atom<SelectionState>({
   shapes: new Set(),
   edges: new Set(),
@@ -28,12 +40,20 @@ export const $selection = atom<SelectionState>({
 export const $revision = atom(0);
 export const $boardName = atom("Untitled");
 /** Style applied to newly created shapes / the current edit target. */
-export const $style = atom<{ fill: string; stroke: string }>({
+export const $style = atom<{ fill: string; fontSize: number }>({
   fill: "#0f2740",
-  stroke: "#38bdf8",
+  fontSize: DEFAULT_TEXT_FONT_SIZE,
 });
 /** Transient hint text shown in the status bar. */
 export const $status = atom("");
+/** Active/highlighted floor index. Transient — never persisted; reset on board load. */
+export const $activeLayer = atom<number>(0);
+/**
+ * Live world-up gap between adjacent floors (the "floor spread" view dial). A UI
+ * mirror of shading.ts's floorStep so the Layers-panel slider and the Option+pinch
+ * gesture stay in sync. Transient view state — never persisted.
+ */
+export const $floorSpacing = atom<number>(FLOOR_STEP);
 
 export function bumpRevision(): void {
   $revision.set($revision.get() + 1);

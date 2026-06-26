@@ -1,7 +1,9 @@
 import { measureTextBox } from "../render/measure";
 import { scene } from "../render/scene";
 import { uid } from "../util";
+import { computeAutoLayoutEdgeBends, computeAutoLayoutPositions, isFullyAnchoredEdge } from "./autoLayout";
 import {
+  $activeLayer,
   $boardName,
   $selection,
   $style,
@@ -9,7 +11,7 @@ import {
   doc,
   setSelection,
 } from "./store";
-import type { Board, Edge, ID, Shape, ShapeKind } from "./types";
+import type { Board, Edge, ID, LayerDef, Shape, ShapeKind } from "./types";
 
 export const DEFAULT_SIZE = 110;
 
@@ -33,19 +35,92 @@ function normalizeOrder(board: Board): ID[] {
   return [...missingEdges, ...kept, ...missingShapes];
 }
 
+/**
+ * Backfill `board.layers` for boards saved before the named-floor feature.
+ * All-ground boards (every shape at layer 0) get an empty list (one implicit
+ * floor — looks like today). Boards that used z-ordering get one synthesized
+ * named floor per distinct elevation so their stacking still reads correctly.
+ */
+export function ensureLayers(board: Board): void {
+  if (board.layers) return;
+  let maxL = 0;
+  for (const s of Object.values(board.shapes)) maxL = Math.max(maxL, s.layer ?? 0);
+  board.layers =
+    maxL === 0
+      ? []
+      : Array.from({ length: maxL + 1 }, (_, i): LayerDef => ({
+          id: uid(),
+          name: i === 0 ? "Ground" : `Layer ${i}`,
+        }));
+}
+
 /** Replace the active document and rebuild the scene from scratch. */
 export function loadBoard(board: Board): void {
   board.order = normalizeOrder(board);
+  ensureLayers(board);
   doc.board = board;
   $boardName.set(board.name);
+  $activeLayer.set(0);
   setSelection([], []);
   scene.rebuild();
+}
+
+/** Replace just the diagram contents of the active board as one undoable edit. */
+export function replaceBoardContent(
+  next: Pick<Board, "name" | "shapes" | "edges" | "order"> & { layers?: LayerDef[] },
+): void {
+  doc.board.name = next.name.trim() || doc.board.name;
+  doc.board.shapes = next.shapes;
+  doc.board.edges = next.edges;
+  doc.board.layers = next.layers ?? [];
+  doc.board.order = normalizeOrder(doc.board);
+  $boardName.set(doc.board.name);
+  $activeLayer.set(0);
+  setSelection([], []);
+  scene.rebuild();
+  bumpRevision();
 }
 
 export function renameBoard(name: string): void {
   doc.board.name = name;
   $boardName.set(name);
   bumpRevision();
+}
+
+export function autoLayoutBoard(): boolean {
+  const positions = computeAutoLayoutPositions(doc.board);
+  let changed = false;
+
+  for (const [id, pos] of Object.entries(positions)) {
+    const shape = doc.board.shapes[id];
+    if (!shape) continue;
+    if (shape.x === pos.x && shape.y === pos.y) continue;
+    shape.x = pos.x;
+    shape.y = pos.y;
+    scene.updateNode(id);
+    changed = true;
+  }
+
+  const bends = computeAutoLayoutEdgeBends(doc.board);
+  for (const edge of Object.values(doc.board.edges)) {
+    if (!isFullyAnchoredEdge(edge)) continue;
+    const bend = bends[edge.id];
+    const nextCx = bend?.cx;
+    const nextCy = bend?.cy;
+    if (edge.cx === nextCx && edge.cy === nextCy) continue;
+    if (bend) {
+      edge.cx = bend.cx;
+      edge.cy = bend.cy;
+    } else {
+      delete edge.cx;
+      delete edge.cy;
+    }
+    scene.updateEdge(edge.id);
+    changed = true;
+  }
+
+  if (changed) bumpRevision();
+  return changed;
 }
 
 export function createShape(
@@ -65,8 +140,9 @@ export function createShape(
     w,
     h,
     fill: style.fill,
-    stroke: style.stroke,
+    fontSize: style.fontSize,
     text: "",
+    layer: $activeLayer.get(), // new tokens land on the active floor
     ...extra,
   };
   doc.board.shapes[shape.id] = shape;
@@ -97,16 +173,37 @@ export function moveShapesBy(ids: Iterable<ID>, dx: number, dy: number): void {
 
 export function setShapesStyle(
   ids: Iterable<ID>,
-  patch: { fill?: string; stroke?: string },
+  patch: { fill?: string },
 ): void {
   for (const id of ids) {
     const s = doc.board.shapes[id];
     if (!s) continue;
     if (patch.fill !== undefined) s.fill = patch.fill;
-    if (patch.stroke !== undefined) s.stroke = patch.stroke;
     scene.updateNode(id);
   }
   bumpRevision();
+}
+
+/**
+ * Apply an absolute label/text font size (a size preset) to each shape. Text
+ * objects are content-sized, so they re-measure their box to the new font
+ * (top-left pinned); other shapes just restyle their centered label.
+ */
+export function setShapesFontSize(ids: Iterable<ID>, fontSize: number): void {
+  let changed = false;
+  for (const id of ids) {
+    const s = doc.board.shapes[id];
+    if (!s) continue;
+    s.fontSize = fontSize;
+    if (s.kind === "text") {
+      const box = measureTextBox(s.text, fontSize);
+      s.w = box.w;
+      s.h = box.h;
+    }
+    scene.updateNode(id);
+    changed = true;
+  }
+  if (changed) bumpRevision();
 }
 
 export function setShapeText(id: ID, text: string): void {
@@ -136,29 +233,207 @@ export function deleteShape(id: ID): void {
   bumpRevision();
 }
 
-/**
- * Move shapes to the top of the unified paint order (drawn last → in front of
- * every other shape and edge). `order` is bottom→top and holds both shape and
- * edge ids; the moved ids keep their relative order.
- */
+// ---------------------------------------------------------------------------
+// Layering in 3D. Paint order is driven by each shape's integer `layer`, which
+// renders as a world-up elevation (a higher layer lifts the token off the board
+// toward the viewer = "front"; a lower layer sinks it = "back"). These actions
+// move the selected shapes up/down through layers; the renderer re-sorts and
+// re-elevates from the new value.
+// ---------------------------------------------------------------------------
+
+/** Highest (`pick=max`) or lowest (`pick=min`) layer among shapes NOT in `ids`. */
+function boundaryLayer(ids: Set<ID>, pick: "max" | "min"): number {
+  let best = pick === "max" ? -Infinity : Infinity;
+  for (const [id, s] of Object.entries(doc.board.shapes)) {
+    if (ids.has(id)) continue;
+    const L = s.layer ?? 0;
+    best = pick === "max" ? Math.max(best, L) : Math.min(best, L);
+  }
+  return Number.isFinite(best) ? best : 0;
+}
+
+/** Set each selected shape's layer via `next`, redraw it, and persist if changed. */
+function applyLayer(ids: Iterable<ID>, next: (cur: number) => number): void {
+  let changed = false;
+  for (const id of new Set(ids)) {
+    const s = doc.board.shapes[id];
+    if (!s) continue;
+    const cur = s.layer ?? 0;
+    const nl = next(cur);
+    if (nl === cur) continue;
+    s.layer = nl;
+    scene.updateNode(id); // re-elevate the pedestal + refresh connected edges
+    changed = true;
+  }
+  if (changed) bumpRevision();
+}
+
+/** Lift the selection above every other shape (drawn on top / nearest the viewer). */
 export function bringToFront(ids: Iterable<ID>): void {
-  reorderShapes(ids, "front");
-}
-
-/** Move shapes to the bottom of the paint order (drawn first → behind everything). */
-export function sendToBack(ids: Iterable<ID>): void {
-  reorderShapes(ids, "back");
-}
-
-function reorderShapes(ids: Iterable<ID>, where: "front" | "back"): void {
   const set = new Set(ids);
-  const order = doc.board.order;
-  const moved = order.filter((id) => set.has(id));
-  if (!moved.length) return;
-  const kept = order.filter((id) => !set.has(id));
-  doc.board.order = where === "front" ? [...kept, ...moved] : [...moved, ...kept];
-  scene.reorder();
+  const target = boundaryLayer(set, "max") + 1;
+  applyLayer(set, () => target);
+}
+
+/** Sink the selection below every other shape (drawn behind everything). */
+export function sendToBack(ids: Iterable<ID>): void {
+  const set = new Set(ids);
+  const target = boundaryLayer(set, "min") - 1;
+  applyLayer(set, () => target);
+}
+
+/** Raise the selection one layer toward the viewer. */
+export function bringForward(ids: Iterable<ID>): void {
+  applyLayer(ids, (cur) => cur + 1);
+}
+
+/** Lower the selection one layer away from the viewer. */
+export function sendBackward(ids: Iterable<ID>): void {
+  applyLayer(ids, (cur) => cur - 1);
+}
+
+// ---------------------------------------------------------------------------
+// Named floors. The board carries an ordered list of named floors; a shape's
+// `layer` is its index into that list. These manage the list itself (the
+// per-shape assignment reuses applyLayer above).
+// ---------------------------------------------------------------------------
+
+/** Highest floor index actually occupied by a shape (0 when none are elevated). */
+function maxShapeFloor(): number {
+  let m = 0;
+  for (const s of Object.values(doc.board.shapes)) m = Math.max(m, s.layer ?? 0);
+  return m;
+}
+
+/** Number of floors the board renders (named list, occupied shapes, min 1). */
+export function floorCount(board: Board): number {
+  let m = 0;
+  for (const s of Object.values(board.shapes)) m = Math.max(m, s.layer ?? 0);
+  return Math.max(board.layers?.length ?? 0, m + 1, 1);
+}
+
+/** Add a new floor on top of the stack and return its index. */
+export function addLayer(name?: string): number {
+  const layers = (doc.board.layers ??= []);
+  // promote the implicit ground floor into the list so indices line up
+  if (layers.length === 0) {
+    const ground = Math.max(1, maxShapeFloor() + 1);
+    for (let i = 0; i < ground; i++) {
+      layers.push({ id: uid(), name: i === 0 ? "Ground" : `Layer ${i}` });
+    }
+  }
+  const idx = layers.length;
+  layers.push({ id: uid(), name: name ?? `Layer ${idx}` });
   bumpRevision();
+  return idx;
+}
+
+/** Rename a floor by index. */
+export function renameLayer(index: number, name: string): void {
+  const L = doc.board.layers?.[index];
+  if (!L) return;
+  L.name = name.trim() || L.name;
+  bumpRevision();
+}
+
+/** Remove a floor: shapes on it drop to the floor below, higher shapes re-index down. */
+export function deleteLayer(index: number): void {
+  const layers = doc.board.layers;
+  if (!layers || index < 0 || index >= layers.length) return;
+  layers.splice(index, 1);
+  for (const s of Object.values(doc.board.shapes)) {
+    const l = s.layer ?? 0;
+    if (l === index) s.layer = Math.max(0, index - 1);
+    else if (l > index) s.layer = l - 1;
+    scene.updateNode(s.id);
+  }
+  const active = $activeLayer.get();
+  if (active >= layers.length) $activeLayer.set(Math.max(0, layers.length - 1));
+  bumpRevision();
+}
+
+/** Move the given shapes onto floor `index`. */
+export function assignSelectionToLayer(ids: Iterable<ID>, index: number): void {
+  applyLayer(ids, () => index);
+}
+
+/**
+ * Ensure `board.layers` has a named entry for every rendered floor, promoting the
+ * implicit ground/elevated floors into the list so per-floor flags (name, hidden)
+ * have somewhere to live. Returns the (now fully-populated) layers array.
+ */
+function materializeLayers(): LayerDef[] {
+  const layers = (doc.board.layers ??= []);
+  const n = floorCount(doc.board);
+  while (layers.length < n) {
+    const i = layers.length;
+    layers.push({ id: uid(), name: i === 0 ? "Ground" : `Layer ${i}` });
+  }
+  return layers;
+}
+
+/** Whether floor `index` is currently hidden. */
+export function isLayerHidden(board: Board, index: number): boolean {
+  return !!board.layers?.[index]?.hidden;
+}
+
+/** Lowest floor index that is still visible, or null when every floor is hidden. */
+function firstVisibleFloor(): number | null {
+  const n = floorCount(doc.board);
+  for (let i = 0; i < n; i++) if (!isLayerHidden(doc.board, i)) return i;
+  return null;
+}
+
+/**
+ * Show or hide a floor. A hidden floor's frame, tokens, edges and badge stop
+ * rendering and stop hit-testing. Selected shapes on it are dropped, and if the
+ * active floor is the one being hidden the highlight hops to a visible floor so
+ * new shapes never land somewhere invisible.
+ */
+export function setLayerHidden(index: number, hidden: boolean): void {
+  const layers = materializeLayers();
+  const L = layers[index];
+  if (!L || !!L.hidden === hidden) return;
+  if (hidden) L.hidden = true;
+  else delete L.hidden;
+
+  if (hidden) {
+    const sel = $selection.get();
+    const kept = [...sel.shapes].filter((id) => (doc.board.shapes[id]?.layer ?? 0) !== index);
+    if (kept.length !== sel.shapes.size) setSelection(kept, sel.edges);
+    if ($activeLayer.get() === index) {
+      const next = firstVisibleFloor();
+      if (next != null) $activeLayer.set(next);
+    }
+  }
+
+  scene.refreshLayerVisibility();
+  bumpRevision();
+}
+
+/** Flip a floor between shown and hidden. */
+export function toggleLayerHidden(index: number): void {
+  setLayerHidden(index, !isLayerHidden(doc.board, index));
+}
+
+/** Cycle the active/highlighted floor by `dir`, wrapping through the stack. */
+export function cycleActiveLayer(dir: 1 | -1): void {
+  const n = floorCount(doc.board);
+  const cur = $activeLayer.get();
+  $activeLayer.set(((cur + dir) % n + n) % n);
+}
+
+/**
+ * Drop any selected SHAPES that aren't on floor `i` (edges are left alone). Keeps
+ * the invariant that only nodes on the active floor can be selected, so switching
+ * floors never leaves a now-hidden node showing selection handles.
+ */
+export function pruneSelectionToLayer(i: number): void {
+  const sel = $selection.get();
+  if (!sel.shapes.size) return;
+  const kept = [...sel.shapes].filter((id) => (doc.board.shapes[id]?.layer ?? 0) === i);
+  if (kept.length === sel.shapes.size) return;
+  setSelection(kept, sel.edges);
 }
 
 export function edgesConnectedTo(id: ID): Edge[] {
@@ -187,7 +462,10 @@ export function createFreeEdge(opts: {
   x2?: number;
   y2?: number;
   directed?: boolean;
+  /** floor a free end floats on (defaults to the active layer); see Edge.layer */
+  layer?: number;
 }): Edge {
+  const style = $style.get();
   const edge: Edge = {
     id: uid(),
     from: opts.from,
@@ -196,9 +474,10 @@ export function createFreeEdge(opts: {
     y1: opts.y1,
     x2: opts.x2,
     y2: opts.y2,
-    stroke: $style.get().stroke,
     label: "",
+    fontSize: style.fontSize,
     directed: opts.directed,
+    layer: opts.layer ?? $activeLayer.get(),
   };
   doc.board.edges[edge.id] = edge;
   // new edges join the top of the shared z-stack, like any newly created object
@@ -248,6 +527,19 @@ export function updateEdge(id: ID, patch: Partial<Edge>): void {
 
 export function setEdgeLabel(id: ID, label: string): void {
   updateEdge(id, { label });
+}
+
+/** Apply an absolute label font size to line/arrow labels. */
+export function setEdgesFontSize(ids: Iterable<ID>, fontSize: number): void {
+  let changed = false;
+  for (const id of ids) {
+    const e = doc.board.edges[id];
+    if (!e) continue;
+    e.fontSize = fontSize;
+    scene.updateEdge(id);
+    changed = true;
+  }
+  if (changed) bumpRevision();
 }
 
 export function deleteSelection(): void {
