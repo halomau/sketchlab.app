@@ -1,4 +1,4 @@
-import { centerOrigin, fitToContent, getZoom, zoomBy } from "../interaction/camera";
+import { centerOrigin, fitToContent, getZoom, isFocusOffBoard, zoomBy } from "../interaction/camera";
 import { generateDiagramWithOpenAI } from "../ai/openaiDiagram";
 import { Controller } from "../interaction/controller";
 import { NO_FILL } from "../render/geometry";
@@ -57,6 +57,9 @@ const ICON_LAYERS = svg(
 );
 const ICON_HELP = svg(
   '<circle cx="12" cy="12" r="9"/><path d="M9.4 9a2.6 2.6 0 0 1 4.6 1.5c0 1.7-2.4 2-2.4 3.7"/><path d="M12 17h.01"/>',
+);
+const ICON_RECENTER = svg(
+  '<circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v4M12 17.5v4M2.5 12h4M17.5 12h4"/>',
 );
 
 const TOOLS: Array<{ tool: ToolName; icon: string; key: string; title: string }> = [
@@ -350,6 +353,23 @@ export async function mountEditor(
     ),
   );
 
+  // ---- recenter prompt ----
+  // Panning is unbounded, so the board can scroll out of view. This pill appears
+  // only once the focus has roamed off the board and snaps the camera back.
+  const recenterBtn = h(
+    "button",
+    {
+      class: "recenter-btn",
+      title: "Recenter on the board",
+      "aria-label": "Recenter on the board",
+      html: `${ICON_RECENTER}<span>Recenter</span>`,
+      onclick: () => fitToContent(),
+    },
+  );
+  const syncRecenter = () => recenterBtn.classList.toggle("is-visible", isFocusOffBoard());
+  unsubs.push($camera.subscribe(syncRecenter));
+  syncRecenter();
+
   // ---- style panel ----
   const fillPicker = createSwatchPicker({
     title: "Fill / background color",
@@ -419,7 +439,7 @@ export async function mountEditor(
   };
   unsubs.push($selection.subscribe(syncStyle));
 
-  editor.append(topbar, banner, toolbar, zoombar, stylePanel);
+  editor.append(topbar, banner, toolbar, zoombar, recenterBtn, stylePanel);
   // cool cyan key-light bloom + corner vignette to seat the tabletop (topmost, no input)
   editor.appendChild(h("div", { class: "tabletop-vignette" }));
 

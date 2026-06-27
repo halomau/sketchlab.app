@@ -77,21 +77,36 @@ function keepDefaultPerspective(next: Camera): Camera {
 }
 
 /**
- * Keep the focus (the ground point shown under the principal point) on the board
- * so a pan/scroll can never carry the camera off into the void where the board
- * is no longer visible. focusX is held between the board's left/right edges;
- * focusY between its far edge (minY) and near edge (maxY). The far-edge bound
- * also honors the geometric floor (`minFocusY`) that keeps the near edge in
- * front of the camera, so this only ever tightens the existing "top" lock.
+ * Pan/scroll is free — the focus (the ground point under the principal point) may
+ * roam off the board into the void; a "Recenter" affordance (see {@link
+ * isFocusOffBoard}) brings the user back instead of a hard wall. The one bound
+ * kept here is the geometric near-plane floor (`minFocusY`): drop the focus below
+ * it and the board's near edge crosses the near plane, `corners()` returns null,
+ * and the field/frame/grid blink out. That's a rendering safeguard, not a
+ * "stay on the board" leash, so focusX and the far/near horizontal extent are
+ * left unbounded.
  */
 function clampFocus(next: Camera): { focusX: number; focusY: number } {
-  const b = scene.getBoardBounds();
-  const loY = Math.max(b.minY, minFocusY(next)); // far edge, never past the near-plane floor
-  const hiY = b.maxY; // near edge
   return {
-    focusX: clamp(next.focusX, b.minX, b.maxX),
-    focusY: clamp(next.focusY, loY, hiY),
+    focusX: next.focusX,
+    focusY: Math.max(next.focusY, minFocusY(next)),
   };
+}
+
+/**
+ * True once the camera focus has roamed well clear of the board — far enough that
+ * it's no longer near the viewport center. The threshold is twice the board's own
+ * half-extent from its center (the bounds already carry a generous margin, so this
+ * keeps the "Recenter" button hidden while the board is still comfortably in view).
+ */
+export function isFocusOffBoard(): boolean {
+  const b = scene.getBoardBounds();
+  const c = $camera.get();
+  const cx = (b.minX + b.maxX) / 2;
+  const cy = (b.minY + b.maxY) / 2;
+  const halfW = (b.maxX - b.minX) / 2;
+  const halfH = (b.maxY - b.minY) / 2;
+  return Math.abs(c.focusX - cx) > halfW * 2 || Math.abs(c.focusY - cy) > halfH * 2;
 }
 
 /** The sole camera writer: clamp, publish, then re-apply the projector + scene. */

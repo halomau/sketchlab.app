@@ -248,6 +248,43 @@ button {
   color: var(--accent);
 }
 
+.recenter-btn {
+  position: absolute;
+  top: 64px;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 16px;
+  background: var(--accent-strong);
+  border: 1px solid var(--accent-strong);
+  color: #04121f;
+  font-size: 13px;
+  font-weight: 600;
+  border-radius: 999px;
+  box-shadow: 0 8px 24px rgba(2, 12, 24, 0.5);
+  z-index: 15;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-50%) translateY(-8px);
+  transition: opacity 0.18s ease, transform 0.18s ease, background 0.12s, border-color 0.12s;
+}
+.recenter-btn.is-visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0);
+}
+.recenter-btn:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.recenter-btn:active {
+  transform: translateX(-50%) translateY(1px);
+}
+.recenter-btn svg {
+  display: block;
+}
+
 .zoombar {
   position: absolute;
   left: 12px;
