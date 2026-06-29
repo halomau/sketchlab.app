@@ -76,6 +76,13 @@ export function boardViewportBounds(
   viewport: ScreenViewport,
   marginPx = DEFAULT_MARGIN_PX,
 ): ShapeBounds | null {
+  if (
+    proj.horizonY !== null &&
+    proj.horizonY >= -marginPx &&
+    proj.horizonY <= viewport.h + marginPx
+  ) {
+    return null;
+  }
   const corners: Array<[number, number]> = [
     [-marginPx, -marginPx],
     [viewport.w + marginPx, -marginPx],

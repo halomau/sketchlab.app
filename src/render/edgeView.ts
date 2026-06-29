@@ -1,4 +1,18 @@
-import { Container, Graphics, Text, type TextStyleOptions } from "pixi.js";
+import {
+  compileHighShaderGlProgram,
+  compileHighShaderGpuProgram,
+  Container,
+  Graphics,
+  localUniformBit,
+  localUniformBitGl,
+  Mesh,
+  MeshGeometry,
+  roundPixelsBit,
+  roundPixelsBitGl,
+  Shader,
+  Text,
+  type TextStyleOptions,
+} from "pixi.js";
 import type { Edge, ID, Shape } from "../state/types";
 import { DEFAULT_TEXT_FONT_SIZE } from "../state/style";
 import { type EdgeGeometry, quadPoints } from "./geometry";
@@ -33,13 +47,25 @@ const GLOW = [
 
 const FLOW_DOT_SPACING = 34;
 const FLOW_DOT_SPEED = 90;
+const FLOW_RIBBON_WIDTH = 8;
+
+const flowUniforms = {
+  uTime: { value: 0, type: "f32" },
+};
+
+let flowShader: Shader | null = null;
+let flowTime = 0;
 
 export interface EdgeView {
   container: Container;
   gfx: Graphics;
+  flowMesh: Mesh<MeshGeometry, Shader> | null;
   label: Text | null;
+  screenPath: FlowPulsePoint[];
+  screenBounds: { minX: number; minY: number; maxX: number; maxY: number } | null;
   from?: ID;
   to?: ID;
+  culled: boolean;
   epoch: number;
 }
 
@@ -47,6 +73,12 @@ export interface FlowPulsePoint {
   sx: number;
   sy: number;
   scale?: number;
+}
+
+interface FlowRibbonData {
+  positions: Float32Array;
+  uvs: Float32Array;
+  indices: Uint32Array;
 }
 
 function labelStyle(): TextStyleOptions {
@@ -64,18 +96,70 @@ function edgeLabelFontSize(edge: Edge): number {
   return edge.fontSize ?? DEFAULT_TEXT_FONT_SIZE;
 }
 
-export function flowPulsePhase(now = performance.now()): number {
-  return ((now / 1000) * FLOW_DOT_SPEED) % FLOW_DOT_SPACING;
+export function updateFlowPulseShaderTime(now = performance.now()): void {
+  flowTime = ((now / 1000) * FLOW_DOT_SPEED) / FLOW_DOT_SPACING;
+  if (flowShader) flowShader.resources.flowUniforms.uniforms.uTime = flowTime;
 }
 
-/** Draw moving screen-space dots along a projected arrow path, from source to target. */
-export function drawFlowPulseDots(
-  g: Graphics,
+function getFlowShader(): Shader {
+  if (flowShader) return flowShader;
+  const flowBit = {
+    name: "edge-flow-pulse",
+    fragment: {
+      header: /* glsl */ `
+        uniform float uTime;
+      `,
+      main: /* glsl */ `
+        float stripe = fract(vUV.x - uTime);
+        float head = smoothstep(0.02, 0.16, stripe) * (1.0 - smoothstep(0.16, 0.34, stripe));
+        float side = 1.0 - smoothstep(0.25, 1.0, abs(vUV.y));
+        float alpha = side * (0.10 + head * 0.82);
+        vec3 color = mix(vec3(0.4078, 0.9098, 0.9765), vec3(0.9255, 0.9961, 1.0), head);
+        outColor = vec4(color * alpha, alpha);
+      `,
+    },
+  };
+  const flowBitGpu = {
+    name: "edge-flow-pulse",
+    fragment: {
+      header: /* wgsl */ `
+        struct FlowUniforms {
+          uTime: f32,
+        };
+
+        @group(2) @binding(0) var<uniform> flowUniforms : FlowUniforms;
+      `,
+      main: /* wgsl */ `
+        let stripe = fract(vUV.x - flowUniforms.uTime);
+        let head = smoothstep(0.02, 0.16, stripe) * (1.0 - smoothstep(0.16, 0.34, stripe));
+        let side = 1.0 - smoothstep(0.25, 1.0, abs(vUV.y));
+        let alpha = side * (0.10 + head * 0.82);
+        let color = mix(vec3<f32>(0.4078, 0.9098, 0.9765), vec3<f32>(0.9255, 0.9961, 1.0), vec3<f32>(head));
+        outColor = vec4<f32>(color * alpha, alpha);
+      `,
+    },
+  };
+  flowShader = new Shader({
+    glProgram: compileHighShaderGlProgram({
+      name: "edge-flow-pulse",
+      bits: [localUniformBitGl, flowBit, roundPixelsBitGl],
+    }),
+    gpuProgram: compileHighShaderGpuProgram({
+      name: "edge-flow-pulse",
+      bits: [localUniformBit, flowBitGpu, roundPixelsBit],
+    }),
+    resources: { flowUniforms },
+  });
+  flowShader.resources.flowUniforms.uniforms.uTime = flowTime;
+  return flowShader;
+}
+
+function buildFlowRibbonData(
   pts: FlowPulsePoint[],
-  phase: number,
   baseScale = 1,
-): void {
-  if (pts.length < 2) return;
+  target?: FlowRibbonData,
+): FlowRibbonData | null {
+  if (pts.length < 2) return null;
 
   let total = 0;
   const lengths: number[] = [];
@@ -84,45 +168,129 @@ export function drawFlowPulseDots(
     lengths.push(len);
     total += len;
   }
-  if (total < 8) return;
+  if (total < 8) return null;
 
-  for (let target = phase; target < total; target += FLOW_DOT_SPACING) {
-    if (target < 3 || target > total - 3) continue;
+  const positions =
+    target?.positions.length === pts.length * 4
+      ? target.positions
+      : new Float32Array(pts.length * 4);
+  const uvs =
+    target?.uvs.length === pts.length * 4 ? target.uvs : new Float32Array(pts.length * 4);
+  const indices =
+    target?.indices.length === (pts.length - 1) * 6
+      ? target.indices
+      : new Uint32Array((pts.length - 1) * 6);
+  let walked = 0;
 
-    let walked = 0;
-    for (let i = 0; i < lengths.length; i++) {
-      const len = lengths[i];
-      if (walked + len < target) {
-        walked += len;
-        continue;
-      }
-
-      const a = pts[i];
-      const b = pts[i + 1];
-      const t = len > 0 ? (target - walked) / len : 0;
-      const x = a.sx + (b.sx - a.sx) * t;
-      const y = a.sy + (b.sy - a.sy) * t;
-      const scaleA = a.scale ?? baseScale;
-      const scaleB = b.scale ?? baseScale;
-      const sc = scaleA + (scaleB - scaleA) * t;
-      const edgeFade = Math.min(1, target / 22, (total - target) / 22);
-      const radius = Math.max(1.7, Math.min(4.4, 3.4 * sc));
-      const alpha = 0.85 * edgeFade;
-
-      g.circle(x, y, radius * 1.9);
-      g.fill({ color: 0x67e8f9, alpha: alpha * 0.16 });
-      g.circle(x, y, radius);
-      g.fill({ color: 0xecfeff, alpha });
-      break;
-    }
+  for (let i = 0; i < pts.length; i++) {
+    const prev = pts[Math.max(0, i - 1)];
+    const cur = pts[i];
+    const next = pts[Math.min(pts.length - 1, i + 1)];
+    const dx = next.sx - prev.sx;
+    const dy = next.sy - prev.sy;
+    const len = Math.hypot(dx, dy) || 1;
+    const scale = cur.scale ?? baseScale;
+    const halfW = Math.max(2.5, FLOW_RIBBON_WIDTH * scale * 0.5);
+    const nx = (-dy / len) * halfW;
+    const ny = (dx / len) * halfW;
+    const p = i * 4;
+    positions[p] = cur.sx - nx;
+    positions[p + 1] = cur.sy - ny;
+    positions[p + 2] = cur.sx + nx;
+    positions[p + 3] = cur.sy + ny;
+    const u = walked / FLOW_DOT_SPACING;
+    uvs[p] = u;
+    uvs[p + 1] = -1;
+    uvs[p + 2] = u;
+    uvs[p + 3] = 1;
+    if (i < lengths.length) walked += lengths[i];
   }
+
+  for (let i = 0; i < pts.length - 1; i++) {
+    const vi = i * 2;
+    const ii = i * 6;
+    indices[ii] = vi;
+    indices[ii + 1] = vi + 1;
+    indices[ii + 2] = vi + 2;
+    indices[ii + 3] = vi + 1;
+    indices[ii + 4] = vi + 3;
+    indices[ii + 5] = vi + 2;
+  }
+
+  return { positions, uvs, indices };
+}
+
+function syncFlowPulseMesh(view: EdgeView, pts: FlowPulsePoint[], baseScale: number): void {
+  const current = view.flowMesh?.geometry;
+  const data = buildFlowRibbonData(
+    pts,
+    baseScale,
+    current
+      ? {
+          positions: current.positions,
+          uvs: current.uvs,
+          indices: current.indices,
+        }
+      : undefined,
+  );
+  if (!data) {
+    clearFlowPulseMesh(view);
+    return;
+  }
+  if (!view.flowMesh) {
+    const geometry = new MeshGeometry(data);
+    view.flowMesh = new Mesh({ geometry, shader: getFlowShader() });
+    view.container.addChildAt(view.flowMesh, Math.min(1, view.container.children.length));
+    return;
+  }
+  const geometry = view.flowMesh.geometry;
+  if (geometry.positions === data.positions) {
+    geometry.getBuffer("aPosition").update();
+  } else {
+    geometry.positions = data.positions;
+  }
+  if (geometry.uvs === data.uvs) {
+    geometry.getBuffer("aUV").update();
+  } else {
+    geometry.uvs = data.uvs;
+  }
+  if (geometry.indices === data.indices) {
+    geometry.getIndex().update();
+  } else {
+    geometry.indices = data.indices;
+  }
+  view.flowMesh.visible = true;
+}
+
+function clearFlowPulseMesh(view: EdgeView): void {
+  if (!view.flowMesh) return;
+  view.container.removeChild(view.flowMesh);
+  view.flowMesh.geometry.destroy();
+  view.flowMesh.destroy();
+  view.flowMesh = null;
 }
 
 export function createEdgeView(from: ID | undefined, to: ID | undefined): EdgeView {
   const container = new Container();
   const gfx = new Graphics();
   container.addChild(gfx);
-  return { container, gfx, label: null, from, to, epoch: -1 };
+  return {
+    container,
+    gfx,
+    flowMesh: null,
+    label: null,
+    screenPath: [],
+    screenBounds: null,
+    from,
+    to,
+    culled: false,
+    epoch: -1,
+  };
+}
+
+export function destroyEdgeView(view: EdgeView): void {
+  clearFlowPulseMesh(view);
+  view.container.destroy({ children: true });
 }
 
 /** Recompute screen geometry for the current camera and redraw the glowing arrow. */
@@ -130,11 +298,10 @@ export function updateEdgeView(
   view: EdgeView,
   edge: Edge,
   geo: EdgeGeometry,
-  pulsePhase = 0,
   from?: Shape,
   to?: Shape,
 ): void {
-  reprojectEdgeView(view, edge, geo, getActiveProjector(), pulsePhase, from, to);
+  reprojectEdgeView(view, edge, geo, getActiveProjector(), from, to);
 }
 
 export function reprojectEdgeView(
@@ -142,7 +309,6 @@ export function reprojectEdgeView(
   edge: Edge,
   geo: EdgeGeometry,
   proj: Projector,
-  pulsePhase = 0,
   from?: Shape,
   to?: Shape,
 ): void {
@@ -165,7 +331,20 @@ export function reprojectEdgeView(
     const p = projectBoard(proj, world[i].x, world[i].y, hFrom + (hTo - hFrom) * t);
     if (p.ok) scr.push(p);
   }
+  view.screenPath = scr;
+  view.screenBounds = null;
   if (scr.length >= 2) {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const p of scr) {
+      minX = Math.min(minX, p.sx);
+      minY = Math.min(minY, p.sy);
+      maxX = Math.max(maxX, p.sx);
+      maxY = Math.max(maxY, p.sy);
+    }
+    view.screenBounds = { minX, minY, maxX, maxY };
     const sc = scr[Math.floor(scr.length / 2)].scale;
     for (const pass of GLOW) {
       g.moveTo(scr[0].sx, scr[0].sy);
@@ -179,7 +358,7 @@ export function reprojectEdgeView(
       });
     }
     if (edge.directed) {
-      drawFlowPulseDots(g, scr, pulsePhase, sc);
+      syncFlowPulseMesh(view, scr, sc);
       const tip = scr[scr.length - 1];
       const prev = scr[scr.length - 2];
       const ang = Math.atan2(tip.sy - prev.sy, tip.sx - prev.sx);
@@ -190,7 +369,11 @@ export function reprojectEdgeView(
         .lineTo(tip.sx - len * Math.cos(ang + spread), tip.sy - len * Math.sin(ang + spread))
         .closePath();
       g.fill({ color: 0xa5f3fc, alpha: 0.95 });
+    } else {
+      clearFlowPulseMesh(view);
     }
+  } else {
+    clearFlowPulseMesh(view);
   }
 
   // label panel at the projected mid-point

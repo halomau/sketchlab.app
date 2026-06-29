@@ -4,12 +4,15 @@ import type { Edge, ID, Shape } from "../state/types";
 import { DEFAULT_FLOOR_COLOR, drawBoard, type GridBounds } from "./boardLayers";
 import {
   createEdgeView,
+  destroyEdgeView,
   type EdgeView,
-  flowPulsePhase,
   reprojectEdgeView,
+  updateFlowPulseShaderTime,
   updateEdgeView,
 } from "./edgeView";
 import {
+  buildEdgeSiblingIndex,
+  type EdgeSiblingIndex,
   type Pt,
   distToSegment,
   quadPoints,
@@ -47,7 +50,8 @@ import {
 import { createFramePhases, RenderPerfRecorder, timePhase, type RenderFrameStats, type RenderPerfSummary } from "./perfStats";
 import { isBatchablePedestal, PedestalBatch, type BatchNode } from "./pedestalBatch";
 import { syncLayerOrder } from "./renderOrder";
-import { ShapeSpatialIndex } from "./shapeSpatialIndex";
+import { EdgeSpatialIndex } from "./edgeSpatialIndex";
+import { ShapeSpatialIndex, type ShapeBounds } from "./shapeSpatialIndex";
 
 class Scene {
   app!: Application;
@@ -72,12 +76,17 @@ class Scene {
   private nodeEdges = new Map<ID, Set<ID>>();
   private directedEdges = new Set<ID>();
   private shapeIndex = new ShapeSpatialIndex();
+  private edgeIndex = new EdgeSpatialIndex();
+  private edgeSiblingIndex: EdgeSiblingIndex | null = null;
   private pedestalBatch!: PedestalBatch;
 
   /** bumped on every camera change; views reproject lazily when their epoch lags */
   private cameraEpoch = 0;
   private pedestalBatchEpoch = -1;
   private pedestalBatchDirty = true;
+  private batchableNodeIds = new Set<ID>();
+  private pedestalVisibleIds = new Set<ID>();
+  private visibleEdgeIds = new Set<ID>();
   private visibilityDirty = true;
   private sortDirty = true;
 
@@ -92,6 +101,7 @@ class Scene {
   private overlayPulseActive = false;
   private renderScheduled = false;
   private ready = false;
+  private animateNextFrame = false;
   private perf = new RenderPerfRecorder();
   private perfListeners = new Set<(stats: RenderFrameStats) => void>();
   private hitTestMsSinceLastFrame = 0;
@@ -254,6 +264,36 @@ class Scene {
     return false;
   }
 
+  private invalidateEdgeSiblingIndex(): void {
+    this.edgeSiblingIndex = null;
+  }
+
+  private getEdgeSiblingIndex(): EdgeSiblingIndex {
+    this.edgeSiblingIndex ??= buildEdgeSiblingIndex(doc.board.edges);
+    return this.edgeSiblingIndex;
+  }
+
+  private boundsForEdgeGeometry(geo: ReturnType<typeof resolveEdgeGeometry>): ShapeBounds {
+    const pts = [geo.p1, geo.p2];
+    if (geo.ctrl) pts.push(geo.ctrl);
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const p of pts) {
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
+    }
+    return { minX, minY, maxX, maxY };
+  }
+
+  private setEdgeCulled(view: EdgeView, culled: boolean): void {
+    view.culled = culled;
+    view.container.visible = !culled;
+  }
+
   private redrawBoardLayer(b = this.boardBounds()): void {
     drawBoard(this.boardGfx, getActiveProjector(), b, this.floorElevations(), this.activeLayer, this.hiddenFloors(), this.floorColors());
     this.syncFloorBadges(b);
@@ -335,7 +375,7 @@ class Scene {
     for (const [id, v] of this.edgeViews) {
       const e = doc.board.edges[id];
       if (!e) continue;
-      const shown = !this.isEdgeHidden(e);
+      const shown = !this.isEdgeHidden(e) && !v.culled;
       v.container.visible = shown;
       if (!shown) continue;
       const dist = multi ? this.edgeLayerDistance(e) : 0;
@@ -457,19 +497,19 @@ class Scene {
       const stats = this.renderFrame(now);
       this.perf.add(stats);
       for (const fn of this.perfListeners) fn(stats);
-      const animatePulses = this.hasVisibleFlowPulses();
-      if (animatePulses) this.requestRender();
+      if (this.animateNextFrame) this.requestRender();
     });
   }
 
   private renderFrame(now: number): RenderFrameStats {
     const phases = createFramePhases();
     const start = performance.now();
-    const animatePulses = this.hasVisibleFlowPulses();
-    const pulsePhase = animatePulses ? flowPulsePhase(now) : 0;
+    const animateShaderEdges = this.hasAnimatedDirectedEdges();
+    this.animateNextFrame = animateShaderEdges;
+    if (animateShaderEdges) updateFlowPulseShaderTime(now);
     timePhase(phases, "syncBoard", () => this.syncBoardBounds());
     const reprojected = timePhase(phases, "reproject", () =>
-      this.reprojectStale(pulsePhase, animatePulses),
+      this.reprojectStale(),
     );
     timePhase(phases, "visibility", () => {
       if (!this.visibilityDirty) return;
@@ -488,7 +528,8 @@ class Scene {
     });
     timePhase(phases, "pixi", () => this.app.render());
     const batchStats = this.pedestalBatch.getStats();
-    const visibleNodes = this.countVisibleNodes();
+    const collectDetailedStats = this.perfListeners.size > 0;
+    const visibleNodes = collectDetailedStats ? this.countVisibleNodes() : undefined;
     const hitTestMs = this.hitTestMsSinceLastFrame;
     this.hitTestMsSinceLastFrame = 0;
     return {
@@ -500,11 +541,11 @@ class Scene {
       reprojectedEdges: reprojected.edges,
       sortedItems,
       visibleNodes,
-      culledNodes: Math.max(0, this.nodeViews.size - visibleNodes),
+      culledNodes: visibleNodes === undefined ? undefined : Math.max(0, this.nodeViews.size - visibleNodes),
       batchVertices: batchStats.batchVertices,
       batchMeshes: batchStats.batchMeshes,
       batchUploadBytes: batchStats.batchUploadBytes,
-      labelCount: this.countVisibleLabels(),
+      labelCount: collectDetailedStats ? this.countVisibleLabels() : undefined,
       hitTestMs,
     };
   }
@@ -528,7 +569,7 @@ class Scene {
   }
 
   /** Reproject any node/edge view whose epoch lags the camera (coalesced per frame). */
-  private reprojectStale(pulsePhase: number, animatePulses: boolean): { nodes: number; edges: number } {
+  private reprojectStale(): { nodes: number; edges: number } {
     const proj = getActiveProjector();
     const viewport = this.screenSize();
     let nodes = this.syncPedestalBatch(proj);
@@ -550,24 +591,54 @@ class Scene {
       view.epoch = this.cameraEpoch;
       nodes++;
     }
-    for (const [id, view] of this.edgeViews) {
+    const indexedBounds = boardViewportBounds(proj, viewport);
+    const candidateEdgeIds = indexedBounds ? this.edgeIndex.queryRect(indexedBounds) : this.edgeIndex.allIds();
+    const nextVisibleEdgeIds = new Set<ID>();
+    const edgeSiblingIndex = candidateEdgeIds.length ? this.getEdgeSiblingIndex() : undefined;
+    for (const id of candidateEdgeIds) {
+      const view = this.edgeViews.get(id);
       const e = doc.board.edges[id];
-      const animateEdge = animatePulses && !!e?.directed;
-      if (view.epoch === this.cameraEpoch && !animateEdge) continue;
-      if (e) {
+      if (!view || !e) continue;
+      if (this.isEdgeHidden(e)) {
+        this.setEdgeCulled(view, true);
+        continue;
+      }
+      if (view.epoch !== this.cameraEpoch) {
         const fr = e.from ? doc.board.shapes[e.from] : undefined;
         const to = e.to ? doc.board.shapes[e.to] : undefined;
-        reprojectEdgeView(view, e, resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e), proj, pulsePhase, fr, to);
+        reprojectEdgeView(
+          view,
+          e,
+          resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e, edgeSiblingIndex),
+          proj,
+          fr,
+          to,
+        );
+        view.epoch = this.cameraEpoch;
+        edges++;
       }
-      view.epoch = this.cameraEpoch;
-      edges++;
+      const inViewport = this.isEdgeViewInViewport(view);
+      this.setEdgeCulled(view, !inViewport);
+      if (inViewport) nextVisibleEdgeIds.add(id);
     }
+    for (const id of this.visibleEdgeIds) {
+      if (nextVisibleEdgeIds.has(id)) continue;
+      const view = this.edgeViews.get(id);
+      if (view) this.setEdgeCulled(view, true);
+    }
+    this.visibleEdgeIds = nextVisibleEdgeIds;
     return { nodes, edges };
   }
 
-  private hasVisibleFlowPulses(): boolean {
-    if (this.overlayPulseActive) return true;
-    return this.directedEdges.size > 0;
+  private hasAnimatedDirectedEdges(): boolean {
+    for (const id of this.directedEdges) {
+      const edge = doc.board.edges[id];
+      const view = this.edgeViews.get(id);
+      if (edge && view && !view.culled && view.container.visible && !this.isEdgeHidden(edge)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private syncPedestalBatch(proj: Projector): number {
@@ -576,39 +647,51 @@ class Scene {
     const viewport = this.screenSize();
     const indexedBounds = boardViewportBounds(proj, viewport);
     const indexedShapes = indexedBounds ? this.shapeIndex.queryRect(indexedBounds) : Object.values(doc.board.shapes);
-    const candidateIds = new Set(indexedShapes.map((shape) => shape.id));
+    const nextVisibleIds = new Set<ID>();
     const nodes: BatchNode[] = [];
-    for (const [id, view] of this.nodeViews) {
-      const s = doc.board.shapes[id];
-      const batched = !!s && isBatchablePedestal(s);
-      if (!s || !batched || this.isFloorHidden(floorOf(s))) {
-        view.culled = false;
-        view.container.visible = !batched;
-        continue;
-      }
-      if (!candidateIds.has(id)) {
-        view.culled = true;
-        view.container.visible = false;
-        view.labelContainer.visible = false;
-        continue;
-      }
+    for (const s of indexedShapes) {
+      if (!this.batchableNodeIds.has(s.id)) continue;
+      if (this.isFloorHidden(floorOf(s))) continue;
+      const view = this.nodeViews.get(s.id);
+      if (!view) continue;
       const inViewport = isShapeInViewport(s, proj, viewport);
-      view.culled = !inViewport;
+      if (!inViewport) continue;
+      view.culled = false;
       view.container.visible = false;
-      if (!inViewport) {
-        view.labelContainer.visible = false;
-        continue;
-      }
       view.labelContainer.visible = !!s.text;
       if (s.text) reprojectNodeLabelView(view, s, proj);
       const dist = multi ? Math.abs(floorOf(s) - this.activeLayer) : 0;
+      nextVisibleIds.add(s.id);
       nodes.push({
         shape: s,
         alpha: layerFade(dist),
         depth: depthAtBoard(proj, s.x + s.w / 2, s.y + s.h / 2, elevationOf(s) + H_PED),
       });
     }
+    for (const id of this.pedestalVisibleIds) {
+      if (nextVisibleIds.has(id)) continue;
+      const view = this.nodeViews.get(id);
+      if (!view) continue;
+      view.culled = true;
+      view.container.visible = false;
+      view.labelContainer.visible = false;
+    }
+    // A dirty batch can come from a layer/shape-style change, so clean up any
+    // batchable node whose floor is hidden even if it was not visible last frame.
+    if (this.visibilityDirty) {
+      for (const id of this.batchableNodeIds) {
+        if (nextVisibleIds.has(id)) continue;
+        const s = doc.board.shapes[id];
+        if (!s || !this.isFloorHidden(floorOf(s))) continue;
+        const view = this.nodeViews.get(id);
+        if (!view) continue;
+        view.culled = true;
+        view.container.visible = false;
+        view.labelContainer.visible = false;
+      }
+    }
     this.pedestalBatch.update(nodes, proj);
+    this.pedestalVisibleIds = nextVisibleIds;
     this.pedestalBatchDirty = false;
     this.pedestalBatchEpoch = this.cameraEpoch;
     return nodes.length;
@@ -645,10 +728,13 @@ class Scene {
         isEdge: false,
       });
     }
+    let edgeSiblingIndex: EdgeSiblingIndex | undefined;
     for (const [id, view] of this.edgeViews) {
       const e = doc.board.edges[id];
       if (!e) continue;
-      const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e);
+      if (view.culled) continue;
+      edgeSiblingIndex ??= this.getEdgeSiblingIndex();
+      const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e, edgeSiblingIndex);
       const depth = Math.min(
         depthAtBoard(proj, geo.p1.x, geo.p1.y, 0),
         depthAtBoard(proj, geo.p2.x, geo.p2.y, 0),
@@ -682,6 +768,18 @@ class Scene {
     return entries.length + labels.length;
   }
 
+  private isEdgeViewInViewport(view: EdgeView, marginPx = 220): boolean {
+    const b = view.screenBounds;
+    if (!b) return false;
+    const { w, h } = this.screenSize();
+    return (
+      b.maxX >= -marginPx &&
+      b.minX <= w + marginPx &&
+      b.maxY >= -marginPx &&
+      b.minY <= h + marginPx
+    );
+  }
+
   /** Effective stacking layer of an edge: the lowest of its connected endpoints
    * (a free end counts as the edge's own floor), so an edge tucks behind a token
    * that's been brought forward and rides up only when both ends rise. */
@@ -705,6 +803,12 @@ class Scene {
     this.sortDirty = true;
     this.pedestalBatchDirty = true;
     const view = createNodeView(s, () => this.requestRender());
+    if (isBatchablePedestal(s)) {
+      this.batchableNodeIds.add(id);
+      view.culled = true;
+      view.container.visible = false;
+      view.labelContainer.visible = false;
+    }
     view.epoch = this.cameraEpoch;
     this.nodeViews.set(id, view);
     this.shapeIndex.upsert(s);
@@ -723,9 +827,25 @@ class Scene {
     this.pedestalBatchDirty = true;
     updateNodeView(view, s, () => this.requestRender());
     this.shapeIndex.upsert(s);
+    if (isBatchablePedestal(s)) {
+      this.batchableNodeIds.add(id);
+      view.culled = true;
+      view.container.visible = false;
+      view.labelContainer.visible = false;
+    } else {
+      this.batchableNodeIds.delete(id);
+      this.pedestalVisibleIds.delete(id);
+      const shown = !this.isFloorHidden(floorOf(s)) && isShapeInViewport(s, getActiveProjector(), this.screenSize());
+      view.culled = !shown;
+      view.container.visible = shown;
+      view.labelContainer.visible = shown;
+    }
     view.epoch = this.cameraEpoch;
     const edges = this.nodeEdges.get(id);
-    if (edges) for (const eid of edges) this.refreshEdge(eid);
+    if (edges) {
+      const edgeSiblingIndex = this.getEdgeSiblingIndex();
+      for (const eid of edges) this.refreshEdge(eid, edgeSiblingIndex);
+    }
     this.requestRender();
   }
 
@@ -751,6 +871,8 @@ class Scene {
       this.nodeViews.delete(id);
     }
     this.shapeIndex.remove(id);
+    this.batchableNodeIds.delete(id);
+    this.pedestalVisibleIds.delete(id);
     this.nodeEdges.delete(id);
     this.requestRender();
   }
@@ -767,24 +889,42 @@ class Scene {
     if (!e) return;
     this.visibilityDirty = true;
     this.sortDirty = true;
+    this.invalidateEdgeSiblingIndex();
     if (e.directed) this.directedEdges.add(id);
     const view = createEdgeView(e.from, e.to);
     this.edgeViews.set(id, view);
     this.itemLayer.addChild(view.container);
     this.registerAdj(id, e.from, e.to);
-    this.refreshEdge(id);
-    for (const sid of this.pairEdges(e.from, e.to)) if (sid !== id) this.refreshEdge(sid);
+    const edgeSiblingIndex = this.getEdgeSiblingIndex();
+    this.refreshEdge(id, edgeSiblingIndex);
+    for (const sid of this.pairEdges(e.from, e.to))
+      if (sid !== id) this.refreshEdge(sid, edgeSiblingIndex);
     this.requestRender();
   }
 
   updateEdge(id: ID): void {
+    const view = this.edgeViews.get(id);
     const e = doc.board.edges[id];
     if (!e) return;
     this.visibilityDirty = true;
     this.sortDirty = true;
+    const topologyChanged = !!view && (view.from !== e.from || view.to !== e.to);
+    const oldFrom = view?.from;
+    const oldTo = view?.to;
+    this.invalidateEdgeSiblingIndex();
     if (e.directed) this.directedEdges.add(id);
     else this.directedEdges.delete(id);
-    this.refreshEdge(id);
+    if (topologyChanged) {
+      this.unregisterAdj(id, oldFrom, oldTo);
+      this.registerAdj(id, e.from, e.to);
+    }
+    const edgeSiblingIndex = this.getEdgeSiblingIndex();
+    const affected = new Set<ID>([id]);
+    if (topologyChanged) {
+      for (const sid of this.pairEdges(oldFrom, oldTo)) affected.add(sid);
+      for (const sid of this.pairEdges(e.from, e.to)) affected.add(sid);
+    }
+    for (const eid of affected) this.refreshEdge(eid, edgeSiblingIndex);
     this.requestRender();
   }
 
@@ -793,15 +933,21 @@ class Scene {
     this.visibilityDirty = true;
     this.sortDirty = true;
     this.directedEdges.delete(id);
+    this.edgeIndex.remove(id);
+    this.visibleEdgeIds.delete(id);
+    this.invalidateEdgeSiblingIndex();
     const from = view?.from;
     const to = view?.to;
     if (view) {
       this.itemLayer.removeChild(view.container);
-      view.container.destroy({ children: true });
+      destroyEdgeView(view);
       this.edgeViews.delete(id);
     }
     for (const set of this.nodeEdges.values()) set.delete(id);
-    if (from && to) for (const sid of this.pairEdges(from, to)) this.refreshEdge(sid);
+    if (from && to) {
+      const edgeSiblingIndex = this.getEdgeSiblingIndex();
+      for (const sid of this.pairEdges(from, to)) this.refreshEdge(sid, edgeSiblingIndex);
+    }
     this.requestRender();
   }
 
@@ -828,14 +974,38 @@ class Scene {
     }
   }
 
-  private refreshEdge(id: ID): void {
+  private unregisterAdj(edgeId: ID, from: ID | undefined, to: ID | undefined): void {
+    for (const nid of [from, to]) {
+      if (nid === undefined) continue;
+      const set = this.nodeEdges.get(nid);
+      if (!set) continue;
+      set.delete(edgeId);
+      if (!set.size) this.nodeEdges.delete(nid);
+    }
+  }
+
+  private refreshEdge(id: ID, edgeSiblingIndex?: EdgeSiblingIndex): void {
     const view = this.edgeViews.get(id);
     const e = doc.board.edges[id];
     if (!view || !e) return;
     const fr = e.from ? doc.board.shapes[e.from] : undefined;
     const to = e.to ? doc.board.shapes[e.to] : undefined;
-    updateEdgeView(view, e, resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e), 0, fr, to);
+    const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e, edgeSiblingIndex);
+    this.edgeIndex.upsert(id, this.boundsForEdgeGeometry(geo));
+    updateEdgeView(
+      view,
+      e,
+      geo,
+      fr,
+      to,
+    );
+    view.from = e.from;
+    view.to = e.to;
     view.epoch = this.cameraEpoch;
+    const shown = !this.isEdgeHidden(e) && this.isEdgeViewInViewport(view);
+    this.setEdgeCulled(view, !shown);
+    if (shown) this.visibleEdgeIds.add(id);
+    else this.visibleEdgeIds.delete(id);
   }
 
   // ---- bulk ----
@@ -858,12 +1028,17 @@ class Scene {
 
   private clear(): void {
     for (const v of this.nodeViews.values()) this.destroyNodeView(v);
-    for (const v of this.edgeViews.values()) v.container.destroy({ children: true });
+    for (const v of this.edgeViews.values()) destroyEdgeView(v);
     this.nodeViews.clear();
     this.edgeViews.clear();
     this.nodeEdges.clear();
     this.directedEdges.clear();
+    this.batchableNodeIds.clear();
+    this.pedestalVisibleIds.clear();
+    this.visibleEdgeIds.clear();
     this.shapeIndex.clear();
+    this.edgeIndex.clear();
+    this.edgeSiblingIndex = null;
     this.pedestalBatch.clear();
     this.pedestalBatchEpoch = -1;
     this.pedestalBatchDirty = true;
@@ -1026,8 +1201,24 @@ class Scene {
   }
 
   /** Min screen-px distance from `sp` to an edge's projected path (at its draw height). */
-  private edgeScreenDist(e: Edge, sp: Pt, proj: Projector): number {
-    const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e);
+  private edgeScreenDist(
+    e: Edge,
+    sp: Pt,
+    proj: Projector,
+    edgeSiblingIndex?: EdgeSiblingIndex,
+    view?: EdgeView,
+  ): number {
+    if (view?.epoch === this.cameraEpoch && view.screenPath.length >= 2) {
+      let best = Infinity;
+      for (let i = 0; i < view.screenPath.length - 1; i++) {
+        const a = view.screenPath[i];
+        const b = view.screenPath[i + 1];
+        const d = distToSegment(sp, { x: a.sx, y: a.sy }, { x: b.sx, y: b.sy });
+        if (d < best) best = d;
+      }
+      return best;
+    }
+    const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e, edgeSiblingIndex);
     const from = e.from ? doc.board.shapes[e.from] : undefined;
     const to = e.to ? doc.board.shapes[e.to] : undefined;
     // Match reprojectEdgeView exactly: each end rides its node's floor, a free
@@ -1068,10 +1259,23 @@ class Scene {
           result = { kind: "shape", id: s.id };
         }
       }
-      for (const e of Object.values(doc.board.edges)) {
-        if (this.isEdgeHidden(e)) continue;
-        if (this.edgeScreenDist(e, sp, proj) > tolPx) continue;
-        const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e);
+      const edgeSiblingIndex = this.getEdgeSiblingIndex();
+      for (const id of this.visibleEdgeIds) {
+        const e = doc.board.edges[id];
+        const view = this.edgeViews.get(id);
+        if (!e || !view || view.culled || this.isEdgeHidden(e)) continue;
+        const b = view?.screenBounds;
+        if (
+          b &&
+          (sp.x < b.minX - tolPx ||
+            sp.x > b.maxX + tolPx ||
+            sp.y < b.minY - tolPx ||
+            sp.y > b.maxY + tolPx)
+        ) {
+          continue;
+        }
+        if (this.edgeScreenDist(e, sp, proj, edgeSiblingIndex, view) > tolPx) continue;
+        const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e, edgeSiblingIndex);
         const depth = Math.min(
           depthAtBoard(proj, geo.p1.x, geo.p1.y, 0),
           depthAtBoard(proj, geo.p2.x, geo.p2.y, 0),

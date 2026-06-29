@@ -215,9 +215,8 @@ function drawDisc(g: Graphics, s: Shape, proj: Projector): void {
   }
   const sh = shadesOf(s);
 
-  // raised tokens cast a shadow on the floor (floating cue); sunk tokens keep it
-  // tucked under their base so it never floats above the token
-  const shadowH = Math.min(base, 0);
+  // The shadow belongs to the token's own floor, not the global ground plane.
+  const shadowH = base;
   const shadow = projectRing(proj, cx + r * 0.12, cy + r * 0.16, r * 1.06, shadowH);
   if (shadow.length) {
     poly(g, shadow);
@@ -253,9 +252,8 @@ function drawSlab(g: Graphics, s: Shape, proj: Projector): void {
   }
   const sh = shadesOf(s);
 
-  // raised tokens cast a shadow on the floor (floating cue); sunk tokens keep it
-  // tucked under their base so it never floats above the token
-  const shadowH = Math.min(base, 0);
+  // The shadow belongs to the token's own floor, not the global ground plane.
+  const shadowH = base;
   const off = Math.min(s.w, s.h) * 0.12;
   const shadow = projectQuad(proj, x0 + off, y0 + off * 1.3, x1 + off, y1 + off * 1.3, shadowH);
   if (shadow.length) {

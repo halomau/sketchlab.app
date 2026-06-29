@@ -2,15 +2,16 @@ import { describe, expect, it } from "vitest";
 import { Container, Graphics, PerspectiveMesh, Texture } from "pixi.js";
 import { createFramePhases, RenderPerfRecorder, timePhase } from "../src/render/perfStats";
 import { PedestalBatch, type BatchNode } from "../src/render/pedestalBatch";
-import { NO_FILL } from "../src/render/geometry";
+import { buildEdgeSiblingIndex, NO_FILL, resolveEdgeGeometry } from "../src/render/geometry";
 import { collectGridLines } from "../src/render/boardLayers";
-import { createProjector, depthAtBoard, projectBoard } from "../src/render/projection";
+import { createProjector, depthAtBoard, projectBoard, unprojectBoardAt } from "../src/render/projection";
 import { syncLayerOrder, type OrderedLayer } from "../src/render/renderOrder";
-import { H_PED } from "../src/render/shading";
+import { floorElevation, H_ARROW, H_PED } from "../src/render/shading";
 import { boardViewportBounds, isShapeInViewport } from "../src/render/culling";
+import { EdgeSpatialIndex } from "../src/render/edgeSpatialIndex";
 import { InstancedPedestalBatch } from "../src/render/instancedPedestalBatch";
 import { ShapeSpatialIndex } from "../src/render/shapeSpatialIndex";
-import type { Shape } from "../src/state/types";
+import type { Edge, Shape } from "../src/state/types";
 import { type NodeView, reprojectNodeLabelView } from "../src/render/shapeView";
 import { makeCircleScenario } from "./perfScenarios";
 
@@ -52,7 +53,103 @@ function recordSortFrame(recorder: RenderPerfRecorder, phaseMs: number): void {
   });
 }
 
+function makeCirclePairGraph(pairCount: number): {
+  shapes: Shape[];
+  edges: Edge[];
+  shapeRecord: Record<string, Shape>;
+  edgeRecord: Record<string, Edge>;
+} {
+  const shapes: Shape[] = [];
+  const edges: Edge[] = [];
+  const shapeRecord: Record<string, Shape> = {};
+  const edgeRecord: Record<string, Edge> = {};
+  const cols = 25;
+  const gap = 82;
+  const colStep = 180;
+  const rowStep = 116;
+  const radius = 28;
+
+  for (let i = 0; i < pairCount; i++) {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const x = (col - (cols - 1) / 2) * colStep;
+    const y = (row - Math.ceil(pairCount / cols) / 2) * rowStep;
+    const left: Shape = {
+      id: `pair_${i}_a`,
+      kind: "circle",
+      x,
+      y,
+      w: radius * 2,
+      h: radius * 2,
+      fill: "#0f2740",
+      text: "",
+    };
+    const right: Shape = {
+      ...left,
+      id: `pair_${i}_b`,
+      x: x + gap,
+    };
+    const edge: Edge = {
+      id: `edge_${i}`,
+      from: left.id,
+      to: right.id,
+      label: "",
+      directed: true,
+    };
+    shapes.push(left, right);
+    edges.push(edge);
+    shapeRecord[left.id] = left;
+    shapeRecord[right.id] = right;
+    edgeRecord[edge.id] = edge;
+  }
+
+  return { shapes, edges, shapeRecord, edgeRecord };
+}
+
+function edgeBounds(
+  edge: Edge,
+  edges: Record<string, Edge>,
+  shapes: Record<string, Shape>,
+): { minX: number; minY: number; maxX: number; maxY: number } {
+  const geo = resolveEdgeGeometry(edges, shapes, edge);
+  const pts = [geo.p1, geo.p2];
+  if (geo.ctrl) pts.push(geo.ctrl);
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const p of pts) {
+    minX = Math.min(minX, p.x);
+    minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x);
+    maxY = Math.max(maxY, p.y);
+  }
+  return { minX, minY, maxX, maxY };
+}
+
 describe("render performance instrumentation", () => {
+  it("unprojects new raised token positions on the active layer top plane", () => {
+    const projector = createProjector(
+      { focusX: 0, focusY: 0, distance: 1200, pitch: Math.PI / 3, zoom: 1 },
+      { w: 800, h: 600 },
+    );
+    const screen = { sx: 460, sy: 330 };
+    const top = floorElevation(2) + H_PED;
+
+    const layerPoint = unprojectBoardAt(projector, screen.sx, screen.sy, top);
+    const groundPoint = unprojectBoardAt(projector, screen.sx, screen.sy, 0);
+
+    expect(layerPoint).not.toBeNull();
+    expect(groundPoint).not.toBeNull();
+
+    const layerTop = projectBoard(projector, layerPoint!.wx, layerPoint!.wy, top);
+    const groundAsTop = projectBoard(projector, groundPoint!.wx, groundPoint!.wy, top);
+
+    expect(layerTop.sx).toBeCloseTo(screen.sx, 6);
+    expect(layerTop.sy).toBeCloseTo(screen.sy, 6);
+    expect(Math.hypot(groundAsTop.sx - screen.sx, groundAsTop.sy - screen.sy)).toBeGreaterThan(20);
+  });
+
   it("reprojects labels for batched circle objects when the camera changes", () => {
     const textMesh = new PerspectiveMesh({ texture: Texture.WHITE, verticesX: 8, verticesY: 8 });
     const labelContainer = new Container();
@@ -140,6 +237,98 @@ describe("render performance instrumentation", () => {
     const candidates = index.queryRect(bounds!);
     expect(candidates.length).toBeGreaterThan(0);
     expect(candidates.length).toBeLessThan(2000);
+  });
+
+  it("keeps huge shape-index queries bounded near the camera horizon", () => {
+    const inside: Shape = {
+      id: "inside",
+      kind: "rect",
+      x: 0,
+      y: 0,
+      w: 100,
+      h: 100,
+      fill: "#0f2740",
+      text: "",
+    };
+    const outside: Shape = {
+      ...inside,
+      id: "outside",
+      x: 3_000_000,
+      y: 3_000_000,
+    };
+    const index = new ShapeSpatialIndex();
+    index.rebuild([inside, outside]);
+
+    const candidates = index.queryRect({
+      minX: -2_000_000,
+      minY: -2_000_000,
+      maxX: 2_000_000,
+      maxY: 2_000_000,
+    });
+
+    expect(candidates.map((shape) => shape.id)).toEqual(["inside"]);
+  });
+
+  it("falls back from finite viewport bounds when a low camera angle brings the horizon into view", () => {
+    const projector = createProjector(
+      { focusX: 0, focusY: 0, distance: 5000, pitch: 0.1, zoom: 1 },
+      { w: 1440, h: 900 },
+    );
+
+    expect(projector.horizonY).not.toBeNull();
+    expect(boardViewportBounds(projector, { w: 1440, h: 900 })).toBeNull();
+  });
+
+  it("uses a spatial index to narrow mostly-offscreen edge candidates", () => {
+    const edgeRecord: Record<string, Edge> = {};
+    const index = new EdgeSpatialIndex();
+    const cols = 40;
+    for (let i = 0; i < 10_000; i++) {
+      const visible = i < 140;
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const x = visible ? col * 90 - 1800 : 80_000 + col * 120;
+      const y = visible ? row * 90 - 360 : 80_000 + row * 120;
+      const edge: Edge = {
+        id: `free_edge_${i}`,
+        x1: x,
+        y1: y,
+        x2: x + 70,
+        y2: y + 24,
+        label: "",
+      };
+      edgeRecord[edge.id] = edge;
+      index.upsert(edge.id, edgeBounds(edge, edgeRecord, {}));
+    }
+    const projector = createProjector(
+      { focusX: 0, focusY: 0, distance: 5000, pitch: Math.PI / 2, zoom: 1 },
+      { w: 1440, h: 900 },
+    );
+    const bounds = boardViewportBounds(projector, { w: 1440, h: 900 });
+    expect(bounds).not.toBeNull();
+    const candidates = index.queryRect(bounds!);
+    expect(candidates.length).toBeGreaterThan(0);
+    expect(candidates.length).toBeLessThan(1000);
+  });
+
+  it("keeps huge edge-index queries bounded near the camera horizon", () => {
+    const index = new EdgeSpatialIndex();
+    index.upsert("inside", { minX: 0, minY: 0, maxX: 100, maxY: 100 });
+    index.upsert("outside", {
+      minX: 3_000_000,
+      minY: 3_000_000,
+      maxX: 3_000_100,
+      maxY: 3_000_100,
+    });
+
+    const candidates = index.queryRect({
+      minX: -2_000_000,
+      minY: -2_000_000,
+      maxX: 2_000_000,
+      maxY: 2_000_000,
+    });
+
+    expect(candidates).toEqual(["inside"]);
   });
 
   it("culls offscreen shapes before they enter the pedestal batch", () => {
@@ -347,6 +536,71 @@ describe("render performance instrumentation", () => {
     const summary = recorder.summary();
     expect(summary.frames).toBe(90);
     expect(summary.last?.nodeCount).toBe(900);
+    expect(summary.estimatedFps).toBeGreaterThanOrEqual(55);
+  });
+
+  it("keeps 500 edge-linked circle pairs inside a 60fps frame budget", () => {
+    const { shapes, edges, shapeRecord, edgeRecord } = makeCirclePairGraph(500);
+    const batch = new PedestalBatch();
+    const recorder = new RenderPerfRecorder();
+
+    try {
+      for (let frame = 0; frame < 90; frame++) {
+        const projector = createProjector(
+          {
+            focusX: 40,
+            focusY: -20,
+            distance: 6500,
+            pitch: Math.PI / 2,
+            zoom: 0.62,
+            yaw: frame * 0.002,
+          },
+          { w: 1440, h: 900 },
+        );
+        const nodes: BatchNode[] = shapes.map((shape) => ({
+          shape,
+          alpha: 1,
+          depth: depthAtBoard(projector, shape.x + shape.w / 2, shape.y + shape.h / 2, H_PED),
+        }));
+        const phases = createFramePhases();
+        const start = performance.now();
+        const edgeEntries = timePhase(phases, "reproject", () => {
+          batch.update(nodes, projector);
+          const siblingIndex = buildEdgeSiblingIndex(edgeRecord);
+          return edges.map((edge) => {
+            const geo = resolveEdgeGeometry(edgeRecord, shapeRecord, edge, siblingIndex);
+            const p1 = projectBoard(projector, geo.p1.x, geo.p1.y, H_ARROW);
+            const p2 = projectBoard(projector, geo.p2.x, geo.p2.y, H_ARROW);
+            return {
+              visible: p1.ok && p2.ok,
+              depth: Math.min(
+                depthAtBoard(projector, geo.p1.x, geo.p1.y, 0),
+                depthAtBoard(projector, geo.p2.x, geo.p2.y, 0),
+              ),
+            };
+          });
+        });
+        timePhase(phases, "sort", () => edgeEntries.sort((a, b) => b.depth - a.depth));
+        recorder.add({
+          totalMs: performance.now() - start,
+          phases,
+          nodeCount: shapes.length,
+          edgeCount: edges.length,
+          reprojectedNodes: shapes.length,
+          reprojectedEdges: edges.length,
+          sortedItems: shapes.length + edgeEntries.length,
+        });
+        expect(batch.visible).toBe(true);
+        expect(edgeEntries.every((entry) => entry.visible)).toBe(true);
+      }
+    } finally {
+      batch.destroy();
+    }
+
+    const summary = recorder.summary();
+    expect(summary.frames).toBe(90);
+    expect(summary.last?.nodeCount).toBe(1000);
+    expect(summary.last?.edgeCount).toBe(500);
     expect(summary.estimatedFps).toBeGreaterThanOrEqual(55);
   });
 

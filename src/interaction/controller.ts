@@ -1,11 +1,11 @@
 import type { Graphics } from "pixi.js";
 import {
   boundaryPoint,
+  buildEdgeSiblingIndex,
   type Pt,
   quadPoints,
   resolveEdgeGeometry,
 } from "../render/geometry";
-import { drawFlowPulseDots, flowPulsePhase } from "../render/edgeView";
 import {
   NAMEPLATE_BACKGROUND_CSS,
   NAMEPLATE_FONT_WEIGHT,
@@ -85,6 +85,8 @@ type Gesture =
       cx: number;
       cy: number;
       square: boolean;
+      layer: number;
+      elevation: number;
     }
   | { kind: "marquee"; sx: number; sy: number; cx: number; cy: number; base: Set<ID> }
   | { kind: "move"; lastWX: number; lastWY: number; moved: boolean }
@@ -346,7 +348,18 @@ export class Controller {
     }
 
     if (tool === "rect" || tool === "circle") {
-      this.gesture = { kind: "create", tool, sx: p.x, sy: p.y, cx: p.x, cy: p.y, square: e.shiftKey };
+      const layer = $activeLayer.get();
+      this.gesture = {
+        kind: "create",
+        tool,
+        sx: p.x,
+        sy: p.y,
+        cx: p.x,
+        cy: p.y,
+        square: e.shiftKey,
+        layer,
+        elevation: floorElevation(layer) + H_PED,
+      };
       scene.requestRender();
       return;
     }
@@ -378,10 +391,11 @@ export class Controller {
     }
 
     const sel = $selection.get();
+    const selectedEdgeSiblingIndex = sel.edges.size ? buildEdgeSiblingIndex(doc.board.edges) : undefined;
     for (const eid of sel.edges) {
       const e2 = doc.board.edges[eid];
       if (!e2) continue;
-      const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e2);
+      const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e2, selectedEdgeSiblingIndex);
       // free endpoint handles let you re-aim a floating line's ends
       if (e2.from === undefined) {
         const s1 = worldToScreen(geo.p1.x, geo.p1.y);
@@ -578,8 +592,8 @@ export class Controller {
   };
 
   private commitCreate(g: Extract<Gesture, { kind: "create" }>): void {
-    const start = screenToWorld(g.sx, g.sy);
-    const cur = screenToWorld(g.cx, g.cy);
+    const start = screenToWorldAt(g.sx, g.sy, g.elevation);
+    const cur = screenToWorldAt(g.cx, g.cy, g.elevation);
     if (!start || !cur) return; // dragged onto the horizon — nothing to place
     const dragPx = Math.hypot(g.cx - g.sx, g.cy - g.sy);
     let shape: Shape;
@@ -588,12 +602,17 @@ export class Controller {
         g.tool,
         start.x - DEFAULT_SIZE / 2,
         start.y - DEFAULT_SIZE / 2,
+        DEFAULT_SIZE,
+        DEFAULT_SIZE,
+        { layer: g.layer },
       );
     } else {
-      // circles are always 1:1 so the disc, bounding box, and selection ring agree
+      // Resolve the drag on the raised top plane so the visible token lands under the cursor.
       const square = g.square || g.tool === "circle";
       const b = dragBox(start.x, start.y, cur.x, cur.y, square);
-      shape = actions.createShape(g.tool, b.x, b.y, Math.max(8, b.w), Math.max(8, b.h));
+      shape = actions.createShape(g.tool, b.x, b.y, Math.max(8, b.w), Math.max(8, b.h), {
+        layer: g.layer,
+      });
     }
     setSelection([shape.id], []);
     $tool.set("select");
@@ -1289,10 +1308,11 @@ export class Controller {
       }
     }
 
+    const selectedEdgeSiblingIndex = sel.edges.size ? buildEdgeSiblingIndex(doc.board.edges) : undefined;
     for (const eid of sel.edges) {
       const e = doc.board.edges[eid];
       if (!e) continue;
-      const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e);
+      const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e, selectedEdgeSiblingIndex);
       const pts = geo.ctrl ? quadPoints(geo.p1, geo.ctrl, geo.p2, 16) : [geo.p1, geo.p2];
       const s0 = worldToScreen(pts[0].x, pts[0].y);
       g.moveTo(s0.x, s0.y);
@@ -1318,16 +1338,16 @@ export class Controller {
       g.fill({ color: ACCENT, alpha: 0.08 });
       g.stroke({ width: 1, color: ACCENT, alpha: 0.8 });
     } else if (gest.kind === "create") {
-      const a = screenToWorld(gest.sx, gest.sy);
-      const c = screenToWorld(gest.cx, gest.cy);
+      const a = screenToWorldAt(gest.sx, gest.sy, gest.elevation);
+      const c = screenToWorldAt(gest.cx, gest.cy, gest.elevation);
       if (a && c) {
-        // mirror commitCreate: circles preview as a 1:1 box so the draft matches
+        // Mirror commitCreate on the active token's top plane, not the ground shadow.
         const square = gest.square || gest.tool === "circle";
-        const b = dragBox(a.x, a.y, c.x, c.y, square); // ground-space draft box
+        const b = dragBox(a.x, a.y, c.x, c.y, square);
         const pts =
           gest.tool === "circle"
-            ? this.projGroundRing(b.x + b.w / 2, b.y + b.h / 2, b.w / 2, b.h / 2, 0)
-            : this.projGroundBox({ x: b.x, y: b.y, w: b.w, h: b.h } as Shape, 0);
+            ? this.projGroundRing(b.x + b.w / 2, b.y + b.h / 2, b.w / 2, b.h / 2, gest.elevation)
+            : this.projGroundBox({ x: b.x, y: b.y, w: b.w, h: b.h } as Shape, gest.elevation);
         if (pts.length) {
           this.tracePoly(g, pts);
           g.fill({ color: ACCENT, alpha: 0.1 });
@@ -1360,14 +1380,6 @@ export class Controller {
       g.lineTo(gest.px, gest.py);
       g.stroke({ width: 2, color: ACCENT, alpha: 0.9 });
       if (gest.directed) {
-        drawFlowPulseDots(
-          g,
-          [
-            { sx: bs.x, sy: bs.y },
-            { sx: gest.px, sy: gest.py },
-          ],
-          flowPulsePhase(),
-        );
         const ang = Math.atan2(gest.py - bs.y, gest.px - bs.x);
         const sz = 11;
         const sp = Math.PI / 7;

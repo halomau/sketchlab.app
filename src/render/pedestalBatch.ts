@@ -178,6 +178,10 @@ export class PedestalBatch {
   readonly container = new Container();
   private meshes = new Map<string, BatchMesh>();
   private scratchGroups = new Map<string, BatchGroup>();
+  private scratchNodes: BatchNode[] = [];
+  private orderedGroups: BatchGroup[] = [];
+  private orderedMeshes: Mesh<MeshGeometry>[] = [];
+  private orderedKeys: string[] = [];
   private visibleKeys = new Set<string>();
   private stats: PedestalBatchStats = {
     visibleNodes: 0,
@@ -200,7 +204,10 @@ export class PedestalBatch {
       group.positions.length = 0;
       group.indices.length = 0;
     }
-    const sorted = [...nodes].sort((a, b) => b.depth - a.depth);
+    const sorted = this.scratchNodes;
+    sorted.length = 0;
+    sorted.push(...nodes);
+    sorted.sort((a, b) => b.depth - a.depth);
 
     for (const { shape, alpha } of sorted) {
       if (shape.kind === "circle") {
@@ -210,12 +217,24 @@ export class PedestalBatch {
       }
     }
 
-    const ordered = [...groups.values()].filter((group) => group.positions.length > 0).sort((a, b) => {
+    const ordered = this.orderedGroups;
+    ordered.length = 0;
+    for (const group of groups.values()) {
+      if (group.positions.length > 0) ordered.push(group);
+    }
+    ordered.sort((a, b) => {
       const pass = PASS_ORDER.indexOf(a.pass) - PASS_ORDER.indexOf(b.pass);
       if (pass !== 0) return pass;
       return a.color - b.color || a.alpha - b.alpha;
     });
-    this.visibleKeys = new Set(ordered.map((group) => groupKey(group.pass, group.color, group.alpha)));
+    this.visibleKeys.clear();
+    const orderedKeys = this.orderedKeys;
+    orderedKeys.length = 0;
+    for (const group of ordered) {
+      const key = groupKey(group.pass, group.color, group.alpha);
+      this.visibleKeys.add(key);
+      orderedKeys.push(key);
+    }
 
     let batchVertices = 0;
     let batchUploadBytes = 0;
@@ -227,10 +246,24 @@ export class PedestalBatch {
     for (const [key, batch] of this.meshes) {
       batch.mesh.visible = this.visibleKeys.has(key);
     }
-    this.container.removeChildren();
-    for (const group of ordered) {
-      const batch = this.meshes.get(groupKey(group.pass, group.color, group.alpha));
-      if (batch) this.container.addChild(batch.mesh);
+    const orderedMeshes = this.orderedMeshes;
+    orderedMeshes.length = 0;
+    for (const key of orderedKeys) {
+      const batch = this.meshes.get(key);
+      if (batch) orderedMeshes.push(batch.mesh);
+    }
+    let orderChanged = this.container.children.length !== orderedMeshes.length;
+    if (!orderChanged) {
+      for (let i = 0; i < orderedMeshes.length; i++) {
+        if (this.container.children[i] !== orderedMeshes[i]) {
+          orderChanged = true;
+          break;
+        }
+      }
+    }
+    if (orderChanged) {
+      this.container.removeChildren();
+      if (orderedMeshes.length) this.container.addChild(...orderedMeshes);
     }
     this.stats = {
       visibleNodes: nodes.length,
@@ -267,7 +300,7 @@ export class PedestalBatch {
     const bottom = projectCircle(proj, cx, cy, r, base);
     if (!top.length || !bottom.length) return;
 
-    const shadowH = Math.min(base, 0);
+    const shadowH = base;
     const shadow = projectCircle(proj, cx + r * 0.12, cy + r * 0.16, r * 1.06, shadowH);
     if (shadow.length) addFan(groupFor(groups, "shadow", 0x02060a, 0.4 * alpha), shadow);
 
@@ -290,7 +323,7 @@ export class PedestalBatch {
     const bottom = projectQuad(proj, x0, y0, x1, y1, base);
     if (!top.length || !bottom.length) return;
 
-    const shadowH = Math.min(base, 0);
+    const shadowH = base;
     const off = Math.min(shape.w, shape.h) * 0.12;
     const shadow = projectQuad(proj, x0 + off, y0 + off * 1.3, x1 + off, y1 + off * 1.3, shadowH);
     if (shadow.length) addFan(groupFor(groups, "shadow", 0x02060a, 0.4 * alpha), shadow);

@@ -138,6 +138,33 @@ export function pairSiblings(edges: Record<ID, Edge>, edge: Edge): Edge[] {
   return out;
 }
 
+export type EdgeSiblingIndex = Map<string, Edge[]>;
+
+function edgeSiblingKey(a: ID, b: ID): string {
+  return a < b ? `${a}\u0000${b}` : `${b}\u0000${a}`;
+}
+
+/**
+ * Index same-pair edges once for a render pass. Without this, resolving geometry
+ * for every edge scans the full edge table to discover parallel siblings.
+ */
+export function buildEdgeSiblingIndex(edges: Record<ID, Edge>): EdgeSiblingIndex {
+  const index: EdgeSiblingIndex = new Map();
+  for (const edge of Object.values(edges)) {
+    if (edge.from === undefined || edge.to === undefined) continue;
+    const key = edgeSiblingKey(edge.from, edge.to);
+    const siblings = index.get(key);
+    if (siblings) siblings.push(edge);
+    else index.set(key, [edge]);
+  }
+  return index;
+}
+
+function indexedPairSiblings(index: EdgeSiblingIndex, edge: Edge): Edge[] {
+  if (edge.from === undefined || edge.to === undefined) return [edge];
+  return index.get(edgeSiblingKey(edge.from, edge.to)) ?? [edge];
+}
+
 /**
  * Auto control point so parallel edges fan out instead of stacking. Returns null
  * for a lone edge (and the first edge of a pair), which stay straight. Edges rank
@@ -181,6 +208,7 @@ export function resolveEdgeGeometry(
   edges: Record<ID, Edge>,
   shapes: Record<ID, Shape>,
   edge: Edge,
+  siblingIndex?: EdgeSiblingIndex,
 ): EdgeGeometry {
   const { from, to } = edgeEnds(shapes, edge);
   if (edge.cx !== undefined && edge.cy !== undefined) {
@@ -189,7 +217,12 @@ export function resolveEdgeGeometry(
   // auto-fan only applies between two shapes; free edges stay straight
   const ctrl =
     from.shape && to.shape
-      ? autoControl(edge, from.shape, to.shape, pairSiblings(edges, edge))
+      ? autoControl(
+          edge,
+          from.shape,
+          to.shape,
+          siblingIndex ? indexedPairSiblings(siblingIndex, edge) : pairSiblings(edges, edge),
+        )
       : null;
   if (!ctrl) return edgeGeometry(from, to, null);
   const geo = edgeGeometry(from, to, ctrl);

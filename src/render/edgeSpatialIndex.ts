@@ -1,15 +1,7 @@
-import type { ID, Shape } from "../state/types";
-
-export interface ShapeBounds {
-  minX: number;
-  minY: number;
-  maxX: number;
-  maxY: number;
-}
+import type { ID } from "../state/types";
+import { MAX_SPATIAL_QUERY_CELLS, type ShapeBounds } from "./shapeSpatialIndex";
 
 type CellKey = string;
-
-export const MAX_SPATIAL_QUERY_CELLS = 50_000;
 
 interface CellRange {
   minX: number;
@@ -19,54 +11,40 @@ interface CellRange {
   count: number;
 }
 
-function boundsOf(shape: Shape): ShapeBounds {
-  return {
-    minX: Math.min(shape.x, shape.x + shape.w),
-    minY: Math.min(shape.y, shape.y + shape.h),
-    maxX: Math.max(shape.x, shape.x + shape.w),
-    maxY: Math.max(shape.y, shape.y + shape.h),
-  };
-}
-
 function intersects(a: ShapeBounds, b: ShapeBounds): boolean {
   return a.maxX >= b.minX && a.minX <= b.maxX && a.maxY >= b.minY && a.minY <= b.maxY;
 }
 
-export class ShapeSpatialIndex {
+export class EdgeSpatialIndex {
   private cells = new Map<CellKey, Set<ID>>();
-  private shapes = new Map<ID, Shape>();
-  private shapeCells = new Map<ID, CellKey[]>();
+  private bounds = new Map<ID, ShapeBounds>();
+  private edgeCells = new Map<ID, CellKey[]>();
 
   constructor(private readonly cellSize = 512) {}
 
-  rebuild(shapes: Iterable<Shape>): void {
-    this.clear();
-    for (const shape of shapes) this.upsert(shape);
-  }
-
   clear(): void {
     this.cells.clear();
-    this.shapes.clear();
-    this.shapeCells.clear();
+    this.bounds.clear();
+    this.edgeCells.clear();
   }
 
-  upsert(shape: Shape): void {
-    this.remove(shape.id);
-    const keys = this.keysFor(boundsOf(shape));
-    this.shapes.set(shape.id, shape);
-    this.shapeCells.set(shape.id, keys);
+  upsert(id: ID, bounds: ShapeBounds): void {
+    this.remove(id);
+    const keys = this.keysFor(bounds);
+    this.bounds.set(id, bounds);
+    this.edgeCells.set(id, keys);
     for (const key of keys) {
       let cell = this.cells.get(key);
       if (!cell) {
         cell = new Set();
         this.cells.set(key, cell);
       }
-      cell.add(shape.id);
+      cell.add(id);
     }
   }
 
   remove(id: ID): void {
-    const keys = this.shapeCells.get(id);
+    const keys = this.edgeCells.get(id);
     if (!keys) return;
     for (const key of keys) {
       const cell = this.cells.get(key);
@@ -74,46 +52,37 @@ export class ShapeSpatialIndex {
       cell.delete(id);
       if (!cell.size) this.cells.delete(key);
     }
-    this.shapeCells.delete(id);
-    this.shapes.delete(id);
+    this.edgeCells.delete(id);
+    this.bounds.delete(id);
   }
 
-  queryRect(rect: ShapeBounds): Shape[] {
+  queryRect(rect: ShapeBounds): ID[] {
     const keys = this.queryKeysFor(rect);
     if (!keys) return this.scanRect(rect);
-    const out: Shape[] = [];
+    const out: ID[] = [];
     const seen = new Set<ID>();
     for (const key of keys) {
       const cell = this.cells.get(key);
       if (!cell) continue;
       for (const id of cell) {
         if (seen.has(id)) continue;
-        const shape = this.shapes.get(id);
-        if (!shape || !intersects(boundsOf(shape), rect)) continue;
+        const bounds = this.bounds.get(id);
+        if (!bounds || !intersects(bounds, rect)) continue;
         seen.add(id);
-        out.push(shape);
+        out.push(id);
       }
     }
     return out;
   }
 
-  queryPoint(x: number, y: number, radius: number): Shape[] {
-    return this.queryRect({
-      minX: x - radius,
-      minY: y - radius,
-      maxX: x + radius,
-      maxY: y + radius,
-    });
+  allIds(): ID[] {
+    return [...this.bounds.keys()];
   }
 
-  all(): Shape[] {
-    return [...this.shapes.values()];
-  }
-
-  private scanRect(rect: ShapeBounds): Shape[] {
-    const out: Shape[] = [];
-    for (const shape of this.shapes.values()) {
-      if (intersects(boundsOf(shape), rect)) out.push(shape);
+  private scanRect(rect: ShapeBounds): ID[] {
+    const out: ID[] = [];
+    for (const [id, bounds] of this.bounds) {
+      if (intersects(bounds, rect)) out.push(id);
     }
     return out;
   }
