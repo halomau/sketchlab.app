@@ -40,6 +40,7 @@ import {
 import {
   createNodeView,
   type NodeView,
+  reprojectNodeLabelView,
   reprojectNodeView,
   updateNodeView,
 } from "./shapeView";
@@ -598,6 +599,8 @@ class Scene {
         view.labelContainer.visible = false;
         continue;
       }
+      view.labelContainer.visible = !!s.text;
+      if (s.text) reprojectNodeLabelView(view, s, proj);
       const dist = multi ? Math.abs(floorOf(s) - this.activeLayer) : 0;
       nodes.push({
         shape: s,

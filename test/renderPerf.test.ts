@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { Container, Graphics, PerspectiveMesh, Texture } from "pixi.js";
 import { createFramePhases, RenderPerfRecorder, timePhase } from "../src/render/perfStats";
 import { PedestalBatch, type BatchNode } from "../src/render/pedestalBatch";
 import { NO_FILL } from "../src/render/geometry";
@@ -10,6 +11,7 @@ import { boardViewportBounds, isShapeInViewport } from "../src/render/culling";
 import { InstancedPedestalBatch } from "../src/render/instancedPedestalBatch";
 import { ShapeSpatialIndex } from "../src/render/shapeSpatialIndex";
 import type { Shape } from "../src/state/types";
+import { type NodeView, reprojectNodeLabelView } from "../src/render/shapeView";
 import { makeCircleScenario } from "./perfScenarios";
 
 class FakeLayer<T> implements OrderedLayer<T> {
@@ -51,6 +53,55 @@ function recordSortFrame(recorder: RenderPerfRecorder, phaseMs: number): void {
 }
 
 describe("render performance instrumentation", () => {
+  it("reprojects labels for batched circle objects when the camera changes", () => {
+    const textMesh = new PerspectiveMesh({ texture: Texture.WHITE, verticesX: 8, verticesY: 8 });
+    const labelContainer = new Container();
+    labelContainer.addChild(textMesh);
+    const view: NodeView = {
+      container: new Container(),
+      labelContainer,
+      gfx: new Graphics(),
+      iconGfx: new Graphics(),
+      textMesh,
+      textTexture: null,
+      textW: 120,
+      textH: 32,
+      sprite: null,
+      styleKey: "",
+      textKey: "",
+      srcKey: "",
+      labelHidden: false,
+      culled: false,
+      epoch: -1,
+    };
+    const shape: Shape = {
+      id: "labeled-circle",
+      kind: "circle",
+      x: -32,
+      y: -32,
+      w: 64,
+      h: 64,
+      fill: "#0f2740",
+      text: "Labeled",
+    };
+    const firstProjector = createProjector(
+      { focusX: 0, focusY: 0, distance: 5000, pitch: Math.PI / 2, zoom: 1 },
+      { w: 1440, h: 900 },
+    );
+    const secondProjector = createProjector(
+      { focusX: 250, focusY: 100, distance: 5000, pitch: Math.PI / 2, zoom: 1.25 },
+      { w: 1440, h: 900 },
+    );
+
+    reprojectNodeLabelView(view, shape, firstProjector);
+    const firstCorners = [...textMesh.geometry.corners];
+    reprojectNodeLabelView(view, shape, secondProjector);
+    const secondCorners = [...textMesh.geometry.corners];
+
+    expect(textMesh.visible).toBe(true);
+    expect(secondCorners).not.toEqual(firstCorners);
+  });
+
   it("keeps both grid axes visible and capped at far zoom levels", () => {
     const bounds = { minX: -20_000, minY: -20_000, maxX: 20_000, maxY: 20_000 };
     for (const zoom of [0.03, 0.05, 0.08, 0.12]) {

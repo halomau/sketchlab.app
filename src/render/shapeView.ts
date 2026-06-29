@@ -521,6 +521,15 @@ export function reprojectNodeView(view: NodeView, s: Shape, proj: Projector): vo
   placeNameplate(view, s, proj);
 }
 
+export function reprojectNodeLabelView(view: NodeView, s: Shape, proj: Projector): void {
+  view.labelContainer.position.set(0, 0);
+  if (s.kind === "text") {
+    placePerspectiveText(view, s, proj);
+    return;
+  }
+  placeNameplate(view, s, proj);
+}
+
 function placePerspectiveText(view: NodeView, s: Shape, proj: Projector): void {
   if (!view.textMesh) return;
   const q = projectQuad(proj, s.x, s.y, s.x + s.w, s.y + s.h, elevationOf(s));
