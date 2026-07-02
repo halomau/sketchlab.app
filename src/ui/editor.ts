@@ -275,14 +275,18 @@ export async function mountEditor(
 
   const undoBtn = h("button", {
     class: "btn btn--icon",
+    type: "button",
     title: "Undo (⌘/Ctrl+Z)",
-    html: svg('<path d="M9 8 4.5 12 9 16"/><path d="M4.5 12H14a5.5 5.5 0 0 1 0 11h-2"/>'),
+    "aria-label": "Undo",
+    html: svg('<path d="M9 14 4 9l5-5"/><path d="M4 9h10.5A5.5 5.5 0 0 1 20 14.5v0A5.5 5.5 0 0 1 14.5 20H11"/>'),
     onclick: () => undo(),
   });
   const redoBtn = h("button", {
     class: "btn btn--icon",
+    type: "button",
     title: "Redo (⌘/Ctrl+Shift+Z)",
-    html: svg('<path d="M15 8 19.5 12 15 16"/><path d="M19.5 12H10a5.5 5.5 0 0 0 0 11h2"/>'),
+    "aria-label": "Redo",
+    html: svg('<path d="m15 14 5-5-5-5"/><path d="M20 9H9.5A5.5 5.5 0 0 0 4 14.5v0A5.5 5.5 0 0 0 9.5 20H13"/>'),
     onclick: () => redo(),
   });
   unsubs.push($canUndo.subscribe((v) => undoBtn.toggleAttribute("disabled", !v)));
