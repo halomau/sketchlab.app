@@ -79,6 +79,41 @@ export function quadPoints(a: Pt, ctrl: Pt, b: Pt, n = 12): Pt[] {
   return out;
 }
 
+/**
+ * Re-anchor a manual bend after its endpoints move: preserve the control
+ * point's position relative to the chord (fraction along it plus signed
+ * perpendicular offset) instead of its absolute world position, so the bend —
+ * and the label riding it — follows the nodes. The offset stays constant in
+ * world units and is capped at half the chord, so pulling nodes far apart
+ * flattens the curve toward a straight line instead of ballooning it.
+ */
+export function reanchorBend(bend: Pt, oldA: Pt, oldB: Pt, newA: Pt, newB: Pt): Pt {
+  const odx = oldB.x - oldA.x;
+  const ody = oldB.y - oldA.y;
+  const oldLen = Math.hypot(odx, ody);
+  const ndx = newB.x - newA.x;
+  const ndy = newB.y - newA.y;
+  const newLen = Math.hypot(ndx, ndy);
+  if (oldLen < 1e-3 || newLen < 1e-3) {
+    // degenerate chord: carry the bend with the average endpoint motion
+    return {
+      x: bend.x + (newA.x - oldA.x + newB.x - oldB.x) / 2,
+      y: bend.y + (newA.y - oldA.y + newB.y - oldB.y) / 2,
+    };
+  }
+  const wx = bend.x - oldA.x;
+  const wy = bend.y - oldA.y;
+  let t = (wx * odx + wy * ody) / (oldLen * oldLen);
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  const d = (odx * wy - ody * wx) / oldLen;
+  const maxD = newLen / 2;
+  const dd = d > maxD ? maxD : d < -maxD ? -maxD : d;
+  return {
+    x: newA.x + ndx * t + (-ndy / newLen) * dd,
+    y: newA.y + ndy * t + (ndx / newLen) * dd,
+  };
+}
+
 /** Resolved endpoints + control + label anchor for an edge. */
 export interface EdgeGeometry {
   p1: Pt;
@@ -138,6 +173,33 @@ export function pairSiblings(edges: Record<ID, Edge>, edge: Edge): Edge[] {
   return out;
 }
 
+export type EdgeSiblingIndex = Map<string, Edge[]>;
+
+function edgeSiblingKey(a: ID, b: ID): string {
+  return a < b ? `${a}\u0000${b}` : `${b}\u0000${a}`;
+}
+
+/**
+ * Index same-pair edges once for a render pass. Without this, resolving geometry
+ * for every edge scans the full edge table to discover parallel siblings.
+ */
+export function buildEdgeSiblingIndex(edges: Record<ID, Edge>): EdgeSiblingIndex {
+  const index: EdgeSiblingIndex = new Map();
+  for (const edge of Object.values(edges)) {
+    if (edge.from === undefined || edge.to === undefined) continue;
+    const key = edgeSiblingKey(edge.from, edge.to);
+    const siblings = index.get(key);
+    if (siblings) siblings.push(edge);
+    else index.set(key, [edge]);
+  }
+  return index;
+}
+
+function indexedPairSiblings(index: EdgeSiblingIndex, edge: Edge): Edge[] {
+  if (edge.from === undefined || edge.to === undefined) return [edge];
+  return index.get(edgeSiblingKey(edge.from, edge.to)) ?? [edge];
+}
+
 /**
  * Auto control point so parallel edges fan out instead of stacking. Returns null
  * for a lone edge (and the first edge of a pair), which stay straight. Edges rank
@@ -181,6 +243,7 @@ export function resolveEdgeGeometry(
   edges: Record<ID, Edge>,
   shapes: Record<ID, Shape>,
   edge: Edge,
+  siblingIndex?: EdgeSiblingIndex,
 ): EdgeGeometry {
   const { from, to } = edgeEnds(shapes, edge);
   if (edge.cx !== undefined && edge.cy !== undefined) {
@@ -189,7 +252,12 @@ export function resolveEdgeGeometry(
   // auto-fan only applies between two shapes; free edges stay straight
   const ctrl =
     from.shape && to.shape
-      ? autoControl(edge, from.shape, to.shape, pairSiblings(edges, edge))
+      ? autoControl(
+          edge,
+          from.shape,
+          to.shape,
+          siblingIndex ? indexedPairSiblings(siblingIndex, edge) : pairSiblings(edges, edge),
+        )
       : null;
   if (!ctrl) return edgeGeometry(from, to, null);
   const geo = edgeGeometry(from, to, ctrl);

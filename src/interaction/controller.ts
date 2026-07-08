@@ -1,11 +1,11 @@
 import type { Graphics } from "pixi.js";
 import {
   boundaryPoint,
+  buildEdgeSiblingIndex,
   type Pt,
   quadPoints,
   resolveEdgeGeometry,
 } from "../render/geometry";
-import { drawFlowPulseDots, flowPulsePhase } from "../render/edgeView";
 import {
   NAMEPLATE_BACKGROUND_CSS,
   NAMEPLATE_FONT_WEIGHT,
@@ -14,11 +14,12 @@ import {
   NAMEPLATE_TRACKING,
 } from "../render/labelStyle";
 import { getActiveProjector, projectBoard, scaleAtBoard } from "../render/projection";
+import { isShapeInViewport } from "../render/culling";
 import { scene } from "../render/scene";
 import { elevationOf, floorElevation, floorOf, H_ARROW, H_PED } from "../render/shading";
 import { defaultLabelFont } from "../render/shapeView";
 import * as actions from "../state/actions";
-import { DEFAULT_SIZE } from "../state/actions";
+import { averageCircleSize, DEFAULT_SIZE } from "../state/actions";
 import { copySelection, cutSelection, pasteClipboard } from "../state/clipboard";
 import { redo, undo } from "../state/history";
 import { DEFAULT_TEXT_FONT_SIZE } from "../state/style";
@@ -37,7 +38,7 @@ import { measureTextBox, TEXT_FONT_SIZE, TEXT_PAD } from "../render/measure";
 import { panBy, panByScreen, rotateBy, spaceLayersBy, tiltBy, zoomAt } from "./camera";
 import { ContextMenu } from "./contextMenu";
 import { IconPalette } from "./iconPalette";
-import { getWheelZoom } from "./inputPrefs";
+import { getInvertPitch, getRightDragPan, getWheelZoom, getZoomFactor } from "./inputPrefs";
 import { TextEditor } from "./textEditor";
 import { screenToWorld, screenToWorldAt, worldToScreen } from "./viewport";
 
@@ -84,6 +85,8 @@ type Gesture =
       cx: number;
       cy: number;
       square: boolean;
+      layer: number;
+      elevation: number;
     }
   | { kind: "marquee"; sx: number; sy: number; cx: number; cy: number; base: Set<ID> }
   | { kind: "move"; lastWX: number; lastWY: number; moved: boolean }
@@ -146,6 +149,10 @@ export class Controller {
   private subs: Array<() => void> = [];
   /** Last canvas-local pointer position, so a keyboard paste can target the cursor. */
   private lastPointer: Pt | null = null;
+  /** Down point of an in-progress right-button pan, or null. Drives context-menu suppression. */
+  private rightPanStart: Pt | null = null;
+  /** Set when a right-button pan actually dragged, so the ensuing contextmenu is swallowed. */
+  private suppressContextMenu = false;
 
   constructor(private root: HTMLElement) {
     this.textEditor = new TextEditor(root);
@@ -281,6 +288,12 @@ export class Controller {
    */
   private onContextMenu = (e: MouseEvent): void => {
     e.preventDefault();
+    // a right-button pan drag just ended — swallow this menu instead of opening it
+    if (this.suppressContextMenu) {
+      this.suppressContextMenu = false;
+      this.menu.close();
+      return;
+    }
     const p = this.local(e);
     // pick the frontmost shape under the cursor on ANY floor — the active floor
     // is just a visual highlight, not a selection filter
@@ -314,13 +327,26 @@ export class Controller {
 
   // ---- pointer ----
   private onPointerDown = (e: PointerEvent): void => {
-    if (e.button !== 0 && e.button !== 1) return;
+    // Right button (2) is normally reserved for the context menu; it only starts
+    // a gesture here when the "Right-click drag to pan" setting is on.
+    const rightPan = e.button === 2 && getRightDragPan();
+    if (e.button !== 0 && e.button !== 1 && !rightPan) return;
     this.textEditor.commit();
     this.root.setPointerCapture(e.pointerId);
     const p = this.local(e);
     this.lastPointer = p;
     const world = screenToWorld(p.x, p.y);
     const tool = $tool.get();
+
+    // Right-button pan: hold RMB and drag to grab the canvas and pan (hand cursor).
+    // A plain right-click that doesn't drag falls through to the context menu.
+    if (rightPan) {
+      this.gesture = { kind: "pan", lastX: p.x, lastY: p.y };
+      this.rightPanStart = p;
+      this.suppressContextMenu = false;
+      this.root.style.cursor = "grabbing";
+      return;
+    }
 
     // Alt/Option + left-drag orbits the camera (horizontal = yaw, vertical =
     // tilt). A camera gesture: it ignores the active tool and needs no ground
@@ -345,7 +371,18 @@ export class Controller {
     }
 
     if (tool === "rect" || tool === "circle") {
-      this.gesture = { kind: "create", tool, sx: p.x, sy: p.y, cx: p.x, cy: p.y, square: e.shiftKey };
+      const layer = $activeLayer.get();
+      this.gesture = {
+        kind: "create",
+        tool,
+        sx: p.x,
+        sy: p.y,
+        cx: p.x,
+        cy: p.y,
+        square: e.shiftKey,
+        layer,
+        elevation: floorElevation(layer) + H_PED,
+      };
       scene.requestRender();
       return;
     }
@@ -377,10 +414,11 @@ export class Controller {
     }
 
     const sel = $selection.get();
+    const selectedEdgeSiblingIndex = sel.edges.size ? buildEdgeSiblingIndex(doc.board.edges) : undefined;
     for (const eid of sel.edges) {
       const e2 = doc.board.edges[eid];
       if (!e2) continue;
-      const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e2);
+      const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e2, selectedEdgeSiblingIndex);
       // free endpoint handles let you re-aim a floating line's ends
       if (e2.from === undefined) {
         const s1 = worldToScreen(geo.p1.x, geo.p1.y);
@@ -467,18 +505,29 @@ export class Controller {
     switch (g.kind) {
       case "pan":
         panBy(g.lastX, g.lastY, p.x, p.y);
+        // once a right-button pan moves past the click threshold, swallow the
+        // contextmenu that fires on release so the drag doesn't also pop the menu
+        if (
+          this.rightPanStart &&
+          Math.hypot(p.x - this.rightPanStart.x, p.y - this.rightPanStart.y) > MOVE_THRESHOLD
+        ) {
+          this.suppressContextMenu = true;
+        }
         g.lastX = p.x;
         g.lastY = p.y;
         break;
-      case "orbit":
+      case "orbit": {
         // horizontal drag spins the turntable, vertical drag tilts the pitch.
-        // Drag down (dy > 0) lowers pitch toward the horizon — matching the
-        // Alt+scroll tilt direction; setCamera clamps the pitch range.
+        // Natively, drag down (dy > 0) lowers pitch toward the horizon; the
+        // Settings → "Reverse vertical pitch" toggle flips that up/down direction
+        // for users coming from other 3D tools. setCamera clamps the pitch range.
+        const pitchSign = getInvertPitch() ? 1 : -1;
         rotateBy((p.x - g.lastX) * ORBIT_YAW_SPEED);
-        tiltBy(-(p.y - g.lastY) * ORBIT_TILT_SPEED);
+        tiltBy(pitchSign * (p.y - g.lastY) * ORBIT_TILT_SPEED);
         g.lastX = p.x;
         g.lastY = p.y;
         break;
+      }
       case "drawEdge":
         g.px = p.x;
         g.py = p.y;
@@ -500,8 +549,7 @@ export class Controller {
         const dx = world.x - g.lastWX;
         const dy = world.y - g.lastWY;
         const selNow = $selection.get();
-        actions.moveShapesBy(selNow.shapes, dx, dy);
-        actions.moveEdgesBy(selNow.edges, dx, dy);
+        actions.moveSelectionBy(selNow.shapes, selNow.edges, dx, dy);
         g.lastWX = world.x;
         g.lastWY = world.y;
         g.moved = true;
@@ -552,6 +600,7 @@ export class Controller {
   private onPointerUp = (e: PointerEvent): void => {
     const g = this.gesture;
     this.gesture = { kind: "none" };
+    this.rightPanStart = null;
     try {
       this.root.releasePointerCapture(e.pointerId);
     } catch {
@@ -577,22 +626,28 @@ export class Controller {
   };
 
   private commitCreate(g: Extract<Gesture, { kind: "create" }>): void {
-    const start = screenToWorld(g.sx, g.sy);
-    const cur = screenToWorld(g.cx, g.cy);
+    const start = screenToWorldAt(g.sx, g.sy, g.elevation);
+    const cur = screenToWorldAt(g.cx, g.cy, g.elevation);
     if (!start || !cur) return; // dragged onto the horizon — nothing to place
     const dragPx = Math.hypot(g.cx - g.sx, g.cy - g.sy);
     let shape: Shape;
     if (dragPx < 4) {
+      const size = g.tool === "circle" ? averageCircleSize() : DEFAULT_SIZE;
       shape = actions.createShape(
         g.tool,
-        start.x - DEFAULT_SIZE / 2,
-        start.y - DEFAULT_SIZE / 2,
+        start.x - size / 2,
+        start.y - size / 2,
+        size,
+        size,
+        { layer: g.layer },
       );
     } else {
-      // circles are always 1:1 so the disc, bounding box, and selection ring agree
+      // Resolve the drag on the raised top plane so the visible token lands under the cursor.
       const square = g.square || g.tool === "circle";
       const b = dragBox(start.x, start.y, cur.x, cur.y, square);
-      shape = actions.createShape(g.tool, b.x, b.y, Math.max(8, b.w), Math.max(8, b.h));
+      shape = actions.createShape(g.tool, b.x, b.y, Math.max(8, b.w), Math.max(8, b.h), {
+        layer: g.layer,
+      });
     }
     setSelection([shape.id], []);
     $tool.set("select");
@@ -644,7 +699,6 @@ export class Controller {
       });
     }
     if (edge) {
-      edge.fill = $style.get().fill
       setSelection([], [edge.id]);
       $tool.set("select");
     }
@@ -790,8 +844,9 @@ export class Controller {
       // Mirror zoom's curve: pinch-out (deltaY < 0) fans the stack wider.
       spaceLayersBy(Math.exp(-e.deltaY * 0.01));
     } else if (e.ctrlKey || e.metaKey) {
-      // ⌘/Ctrl + scroll or trackpad pinch → zoom toward the cursor.
-      zoomAt(Math.exp(-e.deltaY * 0.01), p.x, p.y);
+      // ⌘/Ctrl + scroll or trackpad pinch → zoom toward the cursor. The per-notch
+      // strength follows the Settings "Zoom sensitivity" slider.
+      zoomAt(Math.exp(-e.deltaY * getZoomFactor()), p.x, p.y);
     } else if (e.altKey) {
       // Alt/Option+scroll: route by the dominant swipe axis so a trackpad gesture
       // (which carries both deltas) does one thing cleanly. Horizontal → spin the
@@ -805,8 +860,9 @@ export class Controller {
       }
     } else if (getWheelZoom()) {
       // opt-in (Controls → "Scroll wheel zooms"): a plain wheel notch zooms toward
-      // the cursor instead of panning — the behavior a mouse user expects.
-      zoomAt(Math.exp(-e.deltaY * 0.01), p.x, p.y);
+      // the cursor instead of panning — the behavior a mouse user expects. Strength
+      // follows the Settings "Zoom sensitivity" slider.
+      zoomAt(Math.exp(-e.deltaY * getZoomFactor()), p.x, p.y);
     } else {
       panByScreen(-e.deltaX, -e.deltaY);
     }
@@ -1133,12 +1189,13 @@ export class Controller {
     const { w, h } = scene.screenSize();
     const cam = $camera.get();
     const c = screenToWorld(w / 2, h / 2) ?? { x: cam.focusX, y: cam.focusY };
+    const size = averageCircleSize();
     const shape = actions.createShape(
       "icon",
-      c.x - DEFAULT_SIZE / 2,
-      c.y - DEFAULT_SIZE / 2,
-      DEFAULT_SIZE,
-      DEFAULT_SIZE,
+      c.x - size / 2,
+      c.y - size / 2,
+      size,
+      size,
       { icon: key },
     );
     setSelection([shape.id], []);
@@ -1254,10 +1311,13 @@ export class Controller {
   // ---- overlay (screen space) ----
   private drawOverlay(g: Graphics): void {
     const sel = $selection.get();
+    const proj = getActiveProjector();
+    const viewport = scene.screenSize();
 
     for (const id of sel.shapes) {
       const s = doc.board.shapes[id];
       if (!s) continue;
+      if (!isShapeInViewport(s, proj, viewport)) continue;
       // circle/icon get a ring around the raised disc; rect/image a box around the
       // raised slab; text a box on the ground. Everything rides the shape's layer
       // elevation so the outline stays glued to a lifted token.
@@ -1278,7 +1338,7 @@ export class Controller {
     }
 
     const single = this.singleSelectedShape();
-    if (single) {
+    if (single && isShapeInViewport(single, proj, viewport)) {
       for (const c of this.handlePoints(single)) {
         g.rect(c.x - HANDLE / 2, c.y - HANDLE / 2, HANDLE, HANDLE);
         g.fill(0x0b1220);
@@ -1286,10 +1346,11 @@ export class Controller {
       }
     }
 
+    const selectedEdgeSiblingIndex = sel.edges.size ? buildEdgeSiblingIndex(doc.board.edges) : undefined;
     for (const eid of sel.edges) {
       const e = doc.board.edges[eid];
       if (!e) continue;
-      const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e);
+      const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e, selectedEdgeSiblingIndex);
       const pts = geo.ctrl ? quadPoints(geo.p1, geo.ctrl, geo.p2, 16) : [geo.p1, geo.p2];
       const s0 = worldToScreen(pts[0].x, pts[0].y);
       g.moveTo(s0.x, s0.y);
@@ -1315,16 +1376,16 @@ export class Controller {
       g.fill({ color: ACCENT, alpha: 0.08 });
       g.stroke({ width: 1, color: ACCENT, alpha: 0.8 });
     } else if (gest.kind === "create") {
-      const a = screenToWorld(gest.sx, gest.sy);
-      const c = screenToWorld(gest.cx, gest.cy);
+      const a = screenToWorldAt(gest.sx, gest.sy, gest.elevation);
+      const c = screenToWorldAt(gest.cx, gest.cy, gest.elevation);
       if (a && c) {
-        // mirror commitCreate: circles preview as a 1:1 box so the draft matches
+        // Mirror commitCreate on the active token's top plane, not the ground shadow.
         const square = gest.square || gest.tool === "circle";
-        const b = dragBox(a.x, a.y, c.x, c.y, square); // ground-space draft box
+        const b = dragBox(a.x, a.y, c.x, c.y, square);
         const pts =
           gest.tool === "circle"
-            ? this.projGroundRing(b.x + b.w / 2, b.y + b.h / 2, b.w / 2, b.h / 2, 0)
-            : this.projGroundBox({ x: b.x, y: b.y, w: b.w, h: b.h } as Shape, 0);
+            ? this.projGroundRing(b.x + b.w / 2, b.y + b.h / 2, b.w / 2, b.h / 2, gest.elevation)
+            : this.projGroundBox({ x: b.x, y: b.y, w: b.w, h: b.h } as Shape, gest.elevation);
         if (pts.length) {
           this.tracePoly(g, pts);
           g.fill({ color: ACCENT, alpha: 0.1 });
@@ -1357,14 +1418,6 @@ export class Controller {
       g.lineTo(gest.px, gest.py);
       g.stroke({ width: 2, color: ACCENT, alpha: 0.9 });
       if (gest.directed) {
-        drawFlowPulseDots(
-          g,
-          [
-            { sx: bs.x, sy: bs.y },
-            { sx: gest.px, sy: gest.py },
-          ],
-          flowPulsePhase(),
-        );
         const ang = Math.atan2(gest.py - bs.y, gest.px - bs.x);
         const sz = 11;
         const sp = Math.PI / 7;

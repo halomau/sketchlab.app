@@ -4,12 +4,15 @@ import type { Edge, ID, Shape } from "../state/types";
 import { DEFAULT_FLOOR_COLOR, drawBoard, type GridBounds } from "./boardLayers";
 import {
   createEdgeView,
+  destroyEdgeView,
   type EdgeView,
-  flowPulsePhase,
   reprojectEdgeView,
+  updateFlowPulseShaderTime,
   updateEdgeView,
 } from "./edgeView";
 import {
+  buildEdgeSiblingIndex,
+  type EdgeSiblingIndex,
   type Pt,
   distToSegment,
   quadPoints,
@@ -24,8 +27,10 @@ import {
   scaleAtBoard,
   setActiveProjector,
   toProjCamera,
+  unprojectBoardAt,
 } from "./projection";
 import { createFloorLabelTexture, floorLabelKey } from "./floorLabel";
+import { boardViewportBounds, isShapeInViewport } from "./culling";
 import {
   elevationOf,
   floorElevation,
@@ -38,9 +43,15 @@ import {
 import {
   createNodeView,
   type NodeView,
+  reprojectNodeLabelView,
   reprojectNodeView,
   updateNodeView,
 } from "./shapeView";
+import { createFramePhases, RenderPerfRecorder, timePhase, type RenderFrameStats, type RenderPerfSummary } from "./perfStats";
+import { isBatchablePedestal, PedestalBatch, type BatchNode } from "./pedestalBatch";
+import { syncLayerOrder } from "./renderOrder";
+import { EdgeSpatialIndex } from "./edgeSpatialIndex";
+import { ShapeSpatialIndex, type ShapeBounds } from "./shapeSpatialIndex";
 
 class Scene {
   app!: Application;
@@ -63,18 +74,37 @@ class Scene {
   private nodeViews = new Map<ID, NodeView>();
   private edgeViews = new Map<ID, EdgeView>();
   private nodeEdges = new Map<ID, Set<ID>>();
+  private directedEdges = new Set<ID>();
+  private shapeIndex = new ShapeSpatialIndex();
+  private edgeIndex = new EdgeSpatialIndex();
+  private edgeSiblingIndex: EdgeSiblingIndex | null = null;
+  private pedestalBatch!: PedestalBatch;
 
   /** bumped on every camera change; views reproject lazily when their epoch lags */
   private cameraEpoch = 0;
+  private pedestalBatchEpoch = -1;
+  private pedestalBatchDirty = true;
+  private batchableNodeIds = new Set<ID>();
+  private pedestalVisibleIds = new Set<ID>();
+  private visibleEdgeIds = new Set<ID>();
+  private visibilityDirty = true;
+  private sortDirty = true;
 
   /** bounds the board floor/frame was last painted with, so a shape edit that
    * grows/shrinks the board redraws it immediately (not just on the next pan) */
   private lastBoardBounds: GridBounds | null = null;
+  private boardBoundsCache: GridBounds | null = null;
+  private boardBoundsDirty = true;
+  private boardLayerDirty = true;
 
   private overlayRenderer: ((g: Graphics) => void) | null = null;
   private overlayPulseActive = false;
   private renderScheduled = false;
   private ready = false;
+  private animateNextFrame = false;
+  private perf = new RenderPerfRecorder();
+  private perfListeners = new Set<(stats: RenderFrameStats) => void>();
+  private hitTestMsSinceLastFrame = 0;
 
   async init(host: HTMLElement): Promise<void> {
     const app = new Application();
@@ -100,6 +130,8 @@ class Scene {
 
     this.world = new Container(); // kept as an identity-transformed parent for items
     this.itemLayer = new Container();
+    this.pedestalBatch = new PedestalBatch();
+    this.itemLayer.addChild(this.pedestalBatch.container);
     this.labelLayer = new Container();
     this.world.addChild(this.itemLayer, this.labelLayer);
 
@@ -113,6 +145,19 @@ class Scene {
 
   screenSize(): { w: number; h: number } {
     return { w: this.app.renderer.width, h: this.app.renderer.height };
+  }
+
+  getPerformanceSummary(): RenderPerfSummary {
+    return this.perf.summary();
+  }
+
+  resetPerformanceStats(): void {
+    this.perf.reset();
+  }
+
+  onPerformanceFrame(fn: (stats: RenderFrameStats) => void): () => void {
+    this.perfListeners.add(fn);
+    return () => this.perfListeners.delete(fn);
   }
 
   resize(w: number, h: number): void {
@@ -130,7 +175,9 @@ class Scene {
     this.world.position.set(0, 0);
     this.world.scale.set(1);
     this.cameraEpoch++;
-    this.redrawBoardLayer();
+    this.sortDirty = true;
+    this.pedestalBatchDirty = true;
+    this.boardLayerDirty = true;
     this.requestRender();
   }
 
@@ -140,7 +187,7 @@ class Scene {
    * scale with zoom, zooming just shrinks/grows the whole board uniformly instead
    * of extending the floor toward the horizon.
    */
-  private boardBounds(): GridBounds {
+  private computeBoardBounds(): GridBounds {
     const shapes = Object.values(doc.board.shapes);
     if (!shapes.length) return { minX: -900, minY: -680, maxX: 900, maxY: 680 };
     let minX = Infinity;
@@ -156,6 +203,18 @@ class Scene {
     const mx = Math.max(520, (maxX - minX) * 0.45);
     const my = Math.max(420, (maxY - minY) * 0.45);
     return { minX: minX - mx, minY: minY - my, maxX: maxX + mx, maxY: maxY + my };
+  }
+
+  private boardBounds(): GridBounds {
+    if (!this.boardBoundsDirty && this.boardBoundsCache) return this.boardBoundsCache;
+    const bounds = this.computeBoardBounds();
+    this.boardBoundsCache = bounds;
+    this.boardBoundsDirty = false;
+    return bounds;
+  }
+
+  private markBoardBoundsDirty(): void {
+    this.boardBoundsDirty = true;
   }
 
   /** The current finite board rectangle in world space (exposed for pan-clamping). */
@@ -205,22 +264,55 @@ class Scene {
     return false;
   }
 
-  private redrawBoardLayer(): void {
-    const b = this.boardBounds();
+  private invalidateEdgeSiblingIndex(): void {
+    this.edgeSiblingIndex = null;
+  }
+
+  private getEdgeSiblingIndex(): EdgeSiblingIndex {
+    this.edgeSiblingIndex ??= buildEdgeSiblingIndex(doc.board.edges);
+    return this.edgeSiblingIndex;
+  }
+
+  private boundsForEdgeGeometry(geo: ReturnType<typeof resolveEdgeGeometry>): ShapeBounds {
+    const pts = [geo.p1, geo.p2];
+    if (geo.ctrl) pts.push(geo.ctrl);
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const p of pts) {
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
+    }
+    return { minX, minY, maxX, maxY };
+  }
+
+  private setEdgeCulled(view: EdgeView, culled: boolean): void {
+    view.culled = culled;
+    view.container.visible = !culled;
+  }
+
+  private redrawBoardLayer(b = this.boardBounds()): void {
     drawBoard(this.boardGfx, getActiveProjector(), b, this.floorElevations(), this.activeLayer, this.hiddenFloors(), this.floorColors());
     this.syncFloorBadges(b);
     this.lastBoardBounds = b;
+    this.boardLayerDirty = false;
   }
 
   /** Repaint the board frames/plates + floor badges, then schedule a render. Used
    *  after a per-floor change (color, name) that alters the board chrome. */
   redrawBoard(): void {
-    this.redrawBoardLayer();
+    this.boardLayerDirty = true;
+    this.visibilityDirty = true;
+    this.pedestalBatchDirty = true;
     this.requestRender();
   }
 
   /** Re-evaluate floor visibility after a hide/show toggle: repaint frames & badges, then redraw items. */
   refreshLayerVisibility(): void {
+    this.visibilityDirty = true;
     this.redrawBoard();
   }
 
@@ -232,9 +324,12 @@ class Scene {
    * the extra redraw when the projector is unchanged but the bounds shifted.
    */
   private syncBoardBounds(): void {
+    if (!this.boardBoundsDirty && !this.boardLayerDirty) return;
+    const force = this.boardLayerDirty;
     const b = this.boardBounds();
     const last = this.lastBoardBounds;
     if (
+      !force &&
       last &&
       last.minX === b.minX &&
       last.minY === b.minY &&
@@ -243,9 +338,7 @@ class Scene {
     ) {
       return;
     }
-    drawBoard(this.boardGfx, getActiveProjector(), b, this.floorElevations(), this.activeLayer, this.hiddenFloors(), this.floorColors());
-    this.syncFloorBadges(b);
-    this.lastBoardBounds = b;
+    this.redrawBoardLayer(b);
   }
 
   /** Highlight floor `i`: re-glow its frame and re-dim the off-floor tokens. */
@@ -253,7 +346,9 @@ class Scene {
     const next = Math.max(0, Math.min(i, this.floorCount() - 1));
     if (this.activeLayer === next) return;
     this.activeLayer = next;
-    this.redrawBoardLayer();
+    this.visibilityDirty = true;
+    this.pedestalBatchDirty = true;
+    this.boardLayerDirty = true;
     this.requestRender();
   }
 
@@ -268,8 +363,8 @@ class Scene {
     for (const [id, v] of this.nodeViews) {
       const s = doc.board.shapes[id];
       if (!s) continue;
-      const shown = !this.isFloorHidden(floorOf(s));
-      v.container.visible = shown;
+      const shown = !this.isFloorHidden(floorOf(s)) && !v.culled;
+      v.container.visible = shown && !isBatchablePedestal(s);
       v.labelContainer.visible = shown;
       if (!shown) continue;
       const dist = multi ? Math.abs(floorOf(s) - this.activeLayer) : 0;
@@ -280,7 +375,7 @@ class Scene {
     for (const [id, v] of this.edgeViews) {
       const e = doc.board.edges[id];
       if (!e) continue;
-      const shown = !this.isEdgeHidden(e);
+      const shown = !this.isEdgeHidden(e) && !v.culled;
       v.container.visible = shown;
       if (!shown) continue;
       const dist = multi ? this.edgeLayerDistance(e) : 0;
@@ -399,60 +494,232 @@ class Scene {
     requestAnimationFrame((now) => {
       this.renderScheduled = false;
       if (!this.ready) return; // editor was torn down before this frame ran
-      const animatePulses = this.hasVisibleFlowPulses();
-      const pulsePhase = animatePulses ? flowPulsePhase(now) : 0;
-      this.syncBoardBounds(); // grow/shrink the board if a shape edit moved its extent
-      this.reprojectStale(pulsePhase, animatePulses);
-      this.applyActiveDim(); // fade off-floor tokens toward the active layer
-      this.depthSort();
-      this.overlay.clear();
-      if (this.overlayRenderer) this.overlayRenderer(this.overlay);
-      this.app.render();
-      if (animatePulses) this.requestRender();
+      const stats = this.renderFrame(now);
+      this.perf.add(stats);
+      for (const fn of this.perfListeners) fn(stats);
+      if (this.animateNextFrame) this.requestRender();
     });
   }
 
-  /** Reproject any node/edge view whose epoch lags the camera (coalesced per frame). */
-  private reprojectStale(pulsePhase: number, animatePulses: boolean): void {
-    const proj = getActiveProjector();
-    for (const [id, view] of this.nodeViews) {
-      if (view.epoch === this.cameraEpoch) continue;
-      const s = doc.board.shapes[id];
-      if (s) reprojectNodeView(view, s, proj);
-      view.epoch = this.cameraEpoch;
-    }
-    for (const [id, view] of this.edgeViews) {
-      const e = doc.board.edges[id];
-      const animateEdge = animatePulses && !!e?.directed;
-      if (view.epoch === this.cameraEpoch && !animateEdge) continue;
-      if (e) {
-        const fr = e.from ? doc.board.shapes[e.from] : undefined;
-        const to = e.to ? doc.board.shapes[e.to] : undefined;
-        reprojectEdgeView(view, e, resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e), proj, pulsePhase, fr, to);
-      }
-      view.epoch = this.cameraEpoch;
-    }
+  private renderFrame(now: number): RenderFrameStats {
+    const phases = createFramePhases();
+    const start = performance.now();
+    const animateShaderEdges = this.hasAnimatedDirectedEdges();
+    this.animateNextFrame = animateShaderEdges;
+    if (animateShaderEdges) updateFlowPulseShaderTime(now);
+    timePhase(phases, "syncBoard", () => this.syncBoardBounds());
+    const reprojected = timePhase(phases, "reproject", () =>
+      this.reprojectStale(),
+    );
+    timePhase(phases, "visibility", () => {
+      if (!this.visibilityDirty) return;
+      this.applyActiveDim(); // fade off-floor tokens toward the active layer
+      this.visibilityDirty = false;
+    });
+    const sortedItems = timePhase(phases, "sort", () => {
+      if (!this.sortDirty) return 0;
+      const count = this.depthSort();
+      this.sortDirty = false;
+      return count;
+    });
+    timePhase(phases, "overlay", () => {
+      this.overlay.clear();
+      if (this.overlayRenderer) this.overlayRenderer(this.overlay);
+    });
+    timePhase(phases, "pixi", () => this.app.render());
+    const batchStats = this.pedestalBatch.getStats();
+    const collectDetailedStats = this.perfListeners.size > 0;
+    const visibleNodes = collectDetailedStats ? this.countVisibleNodes() : undefined;
+    const hitTestMs = this.hitTestMsSinceLastFrame;
+    this.hitTestMsSinceLastFrame = 0;
+    return {
+      totalMs: performance.now() - start,
+      phases,
+      nodeCount: this.nodeViews.size,
+      edgeCount: this.edgeViews.size,
+      reprojectedNodes: reprojected.nodes,
+      reprojectedEdges: reprojected.edges,
+      sortedItems,
+      visibleNodes,
+      culledNodes: visibleNodes === undefined ? undefined : Math.max(0, this.nodeViews.size - visibleNodes),
+      batchVertices: batchStats.batchVertices,
+      batchMeshes: batchStats.batchMeshes,
+      batchUploadBytes: batchStats.batchUploadBytes,
+      labelCount: collectDetailedStats ? this.countVisibleLabels() : undefined,
+      hitTestMs,
+    };
   }
 
-  private hasVisibleFlowPulses(): boolean {
-    if (this.overlayPulseActive) return true;
-    return Object.values(doc.board.edges).some((edge) => !!edge.directed);
+  private countVisibleNodes(): number {
+    let count = 0;
+    for (const view of this.nodeViews.values()) {
+      if (!view.culled) count++;
+    }
+    return count;
+  }
+
+  private countVisibleLabels(): number {
+    let count = 0;
+    for (const [id, view] of this.nodeViews) {
+      const s = doc.board.shapes[id];
+      if (!s || !s.text || view.culled || view.labelHidden || !view.textMesh?.visible) continue;
+      count++;
+    }
+    return count;
+  }
+
+  /** Reproject any node/edge view whose epoch lags the camera (coalesced per frame). */
+  private reprojectStale(): { nodes: number; edges: number } {
+    const proj = getActiveProjector();
+    const viewport = this.screenSize();
+    let nodes = this.syncPedestalBatch(proj);
+    let edges = 0;
+    for (const [id, view] of this.nodeViews) {
+      const s = doc.board.shapes[id];
+      if (s && isBatchablePedestal(s)) {
+        view.epoch = this.cameraEpoch;
+        continue;
+      }
+      if (view.epoch === this.cameraEpoch) continue;
+      if (s) {
+        const inViewport = !this.isFloorHidden(floorOf(s)) && isShapeInViewport(s, proj, viewport);
+        view.culled = !inViewport;
+        view.container.visible = inViewport;
+        view.labelContainer.visible = inViewport;
+        if (inViewport) reprojectNodeView(view, s, proj);
+      }
+      view.epoch = this.cameraEpoch;
+      nodes++;
+    }
+    const indexedBounds = boardViewportBounds(proj, viewport);
+    const candidateEdgeIds = indexedBounds ? this.edgeIndex.queryRect(indexedBounds) : this.edgeIndex.allIds();
+    const nextVisibleEdgeIds = new Set<ID>();
+    const edgeSiblingIndex = candidateEdgeIds.length ? this.getEdgeSiblingIndex() : undefined;
+    for (const id of candidateEdgeIds) {
+      const view = this.edgeViews.get(id);
+      const e = doc.board.edges[id];
+      if (!view || !e) continue;
+      if (this.isEdgeHidden(e)) {
+        this.setEdgeCulled(view, true);
+        continue;
+      }
+      if (view.epoch !== this.cameraEpoch) {
+        const fr = e.from ? doc.board.shapes[e.from] : undefined;
+        const to = e.to ? doc.board.shapes[e.to] : undefined;
+        reprojectEdgeView(
+          view,
+          e,
+          resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e, edgeSiblingIndex),
+          proj,
+          fr,
+          to,
+        );
+        view.epoch = this.cameraEpoch;
+        edges++;
+      }
+      const inViewport = this.isEdgeViewInViewport(view);
+      this.setEdgeCulled(view, !inViewport);
+      if (inViewport) nextVisibleEdgeIds.add(id);
+    }
+    for (const id of this.visibleEdgeIds) {
+      if (nextVisibleEdgeIds.has(id)) continue;
+      const view = this.edgeViews.get(id);
+      if (view) this.setEdgeCulled(view, true);
+    }
+    this.visibleEdgeIds = nextVisibleEdgeIds;
+    return { nodes, edges };
+  }
+
+  private hasAnimatedDirectedEdges(): boolean {
+    for (const id of this.directedEdges) {
+      const edge = doc.board.edges[id];
+      const view = this.edgeViews.get(id);
+      if (edge && view && !view.culled && view.container.visible && !this.isEdgeHidden(edge)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private syncPedestalBatch(proj: Projector): number {
+    if (!this.pedestalBatchDirty && this.pedestalBatchEpoch === this.cameraEpoch) return 0;
+    const multi = this.floorCount() > 1;
+    const viewport = this.screenSize();
+    const indexedBounds = boardViewportBounds(proj, viewport);
+    const indexedShapes = indexedBounds ? this.shapeIndex.queryRect(indexedBounds) : Object.values(doc.board.shapes);
+    const nextVisibleIds = new Set<ID>();
+    const nodes: BatchNode[] = [];
+    for (const s of indexedShapes) {
+      if (!this.batchableNodeIds.has(s.id)) continue;
+      if (this.isFloorHidden(floorOf(s))) continue;
+      const view = this.nodeViews.get(s.id);
+      if (!view) continue;
+      const inViewport = isShapeInViewport(s, proj, viewport);
+      if (!inViewport) continue;
+      view.culled = false;
+      view.container.visible = false;
+      view.labelContainer.visible = !!s.text;
+      if (s.text) reprojectNodeLabelView(view, s, proj);
+      const dist = multi ? Math.abs(floorOf(s) - this.activeLayer) : 0;
+      nextVisibleIds.add(s.id);
+      nodes.push({
+        shape: s,
+        alpha: layerFade(dist),
+        depth: depthAtBoard(proj, s.x + s.w / 2, s.y + s.h / 2, elevationOf(s) + H_PED),
+      });
+    }
+    for (const id of this.pedestalVisibleIds) {
+      if (nextVisibleIds.has(id)) continue;
+      const view = this.nodeViews.get(id);
+      if (!view) continue;
+      view.culled = true;
+      view.container.visible = false;
+      view.labelContainer.visible = false;
+    }
+    // A dirty batch can come from a layer/shape-style change, so clean up any
+    // batchable node whose floor is hidden even if it was not visible last frame.
+    if (this.visibilityDirty) {
+      for (const id of this.batchableNodeIds) {
+        if (nextVisibleIds.has(id)) continue;
+        const s = doc.board.shapes[id];
+        if (!s || !this.isFloorHidden(floorOf(s))) continue;
+        const view = this.nodeViews.get(id);
+        if (!view) continue;
+        view.culled = true;
+        view.container.visible = false;
+        view.labelContainer.visible = false;
+      }
+    }
+    this.pedestalBatch.update(nodes, proj);
+    this.pedestalVisibleIds = nextVisibleIds;
+    this.pedestalBatchDirty = false;
+    this.pedestalBatchEpoch = this.cameraEpoch;
+    return nodes.length;
   }
 
   /**
-   * Painter's order for the perspective scene. Primary key is the stacking
-   * `layer` (Send to Back / Bring to Front move a token up/down through layers),
-   * so layering is reliable and independent of where a token sits on the board.
-   * Within a layer, farther items paint first (true depth); edges sit behind
-   * nodes on an exact tie.
+   * Painter's order for the perspective scene. Primary key is the named floor
+   * (`layer`). Within a floor, true eye-space depth wins (farther first) — and
+   * Bring/Send Front/Back nudge a shape's within-floor `lift`, which feeds into
+   * that depth via elevation. Edges sit behind nodes on an exact tie.
    */
-  private depthSort(): void {
+  private depthSort(): number {
     const proj = getActiveProjector();
     type Entry = { container: Container; layer: number; depth: number; isEdge: boolean };
     const entries: Entry[] = [];
+    if (this.pedestalBatch.visible) {
+      entries.push({
+        container: this.pedestalBatch.container,
+        layer: this.activeLayer,
+        depth: Number.POSITIVE_INFINITY,
+        isEdge: false,
+      });
+    }
     for (const [id, view] of this.nodeViews) {
       const s = doc.board.shapes[id];
       if (!s) continue;
+      if (view.culled) continue;
+      if (isBatchablePedestal(s)) continue;
       entries.push({
         container: view.container,
         layer: layerOf(s),
@@ -460,10 +727,13 @@ class Scene {
         isEdge: false,
       });
     }
+    let edgeSiblingIndex: EdgeSiblingIndex | undefined;
     for (const [id, view] of this.edgeViews) {
       const e = doc.board.edges[id];
       if (!e) continue;
-      const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e);
+      if (view.culled) continue;
+      edgeSiblingIndex ??= this.getEdgeSiblingIndex();
+      const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e, edgeSiblingIndex);
       const depth = Math.min(
         depthAtBoard(proj, geo.p1.x, geo.p1.y, 0),
         depthAtBoard(proj, geo.p2.x, geo.p2.y, 0),
@@ -476,13 +746,13 @@ class Scene {
       if (Math.abs(dd) > 1e-6) return dd;
       return (a.isEdge ? 0 : 1) - (b.isEdge ? 0 : 1); // edges behind nodes on a tie
     });
-    entries.forEach((e, i) => {
-      if (this.itemLayer.children.includes(e.container)) this.itemLayer.setChildIndex(e.container, i);
-    });
+    syncLayerOrder(this.itemLayer, entries.map((e) => e.container));
     const labels = [];
     for (const [id, view] of this.nodeViews) {
       const s = doc.board.shapes[id];
       if (!s) continue;
+      if (view.culled) continue;
+      if (!s.text || view.labelHidden || !view.textMesh) continue;
       labels.push({
         container: view.labelContainer,
         layer: layerOf(s),
@@ -493,9 +763,20 @@ class Scene {
       if (a.layer !== b.layer) return a.layer - b.layer;
       return b.depth - a.depth;
     });
-    labels.forEach((e, i) => {
-      if (this.labelLayer.children.includes(e.container)) this.labelLayer.setChildIndex(e.container, i);
-    });
+    syncLayerOrder(this.labelLayer, labels.map((e) => e.container));
+    return entries.length + labels.length;
+  }
+
+  private isEdgeViewInViewport(view: EdgeView, marginPx = 220): boolean {
+    const b = view.screenBounds;
+    if (!b) return false;
+    const { w, h } = this.screenSize();
+    return (
+      b.maxX >= -marginPx &&
+      b.minX <= w + marginPx &&
+      b.maxY >= -marginPx &&
+      b.minY <= h + marginPx
+    );
   }
 
   /** Effective stacking layer of an edge: the lowest of its connected endpoints
@@ -516,9 +797,20 @@ class Scene {
   addNode(id: ID): void {
     const s = doc.board.shapes[id];
     if (!s) return;
+    this.markBoardBoundsDirty();
+    this.visibilityDirty = true;
+    this.sortDirty = true;
+    this.pedestalBatchDirty = true;
     const view = createNodeView(s, () => this.requestRender());
+    if (isBatchablePedestal(s)) {
+      this.batchableNodeIds.add(id);
+      view.culled = true;
+      view.container.visible = false;
+      view.labelContainer.visible = false;
+    }
     view.epoch = this.cameraEpoch;
     this.nodeViews.set(id, view);
+    this.shapeIndex.upsert(s);
     this.itemLayer.addChild(view.container);
     this.labelLayer.addChild(view.labelContainer);
     this.requestRender();
@@ -528,10 +820,31 @@ class Scene {
     const view = this.nodeViews.get(id);
     const s = doc.board.shapes[id];
     if (!view || !s) return;
+    this.markBoardBoundsDirty();
+    this.visibilityDirty = true;
+    this.sortDirty = true;
+    this.pedestalBatchDirty = true;
     updateNodeView(view, s, () => this.requestRender());
+    this.shapeIndex.upsert(s);
+    if (isBatchablePedestal(s)) {
+      this.batchableNodeIds.add(id);
+      view.culled = true;
+      view.container.visible = false;
+      view.labelContainer.visible = false;
+    } else {
+      this.batchableNodeIds.delete(id);
+      this.pedestalVisibleIds.delete(id);
+      const shown = !this.isFloorHidden(floorOf(s)) && isShapeInViewport(s, getActiveProjector(), this.screenSize());
+      view.culled = !shown;
+      view.container.visible = shown;
+      view.labelContainer.visible = shown;
+    }
     view.epoch = this.cameraEpoch;
     const edges = this.nodeEdges.get(id);
-    if (edges) for (const eid of edges) this.refreshEdge(eid);
+    if (edges) {
+      const edgeSiblingIndex = this.getEdgeSiblingIndex();
+      for (const eid of edges) this.refreshEdge(eid, edgeSiblingIndex);
+    }
     this.requestRender();
   }
 
@@ -546,18 +859,26 @@ class Scene {
 
   removeNode(id: ID): void {
     const view = this.nodeViews.get(id);
+    this.markBoardBoundsDirty();
+    this.visibilityDirty = true;
+    this.sortDirty = true;
+    this.pedestalBatchDirty = true;
     if (view) {
       this.itemLayer.removeChild(view.container);
       this.labelLayer.removeChild(view.labelContainer);
       this.destroyNodeView(view);
       this.nodeViews.delete(id);
     }
+    this.shapeIndex.remove(id);
+    this.batchableNodeIds.delete(id);
+    this.pedestalVisibleIds.delete(id);
     this.nodeEdges.delete(id);
     this.requestRender();
   }
 
   /** Re-sort paint order. Under perspective this is depth-driven, not z-stack. */
   reorder(): void {
+    this.sortDirty = true;
     this.requestRender();
   }
 
@@ -565,33 +886,67 @@ class Scene {
   addEdge(id: ID): void {
     const e = doc.board.edges[id];
     if (!e) return;
+    this.visibilityDirty = true;
+    this.sortDirty = true;
+    this.invalidateEdgeSiblingIndex();
+    if (e.directed) this.directedEdges.add(id);
     const view = createEdgeView(e.from, e.to);
     this.edgeViews.set(id, view);
     this.itemLayer.addChild(view.container);
     this.registerAdj(id, e.from, e.to);
-    this.refreshEdge(id);
-    for (const sid of this.pairEdges(e.from, e.to)) if (sid !== id) this.refreshEdge(sid);
+    const edgeSiblingIndex = this.getEdgeSiblingIndex();
+    this.refreshEdge(id, edgeSiblingIndex);
+    for (const sid of this.pairEdges(e.from, e.to))
+      if (sid !== id) this.refreshEdge(sid, edgeSiblingIndex);
     this.requestRender();
   }
 
   updateEdge(id: ID): void {
+    const view = this.edgeViews.get(id);
     const e = doc.board.edges[id];
     if (!e) return;
-    this.refreshEdge(id);
+    this.visibilityDirty = true;
+    this.sortDirty = true;
+    const topologyChanged = !!view && (view.from !== e.from || view.to !== e.to);
+    const oldFrom = view?.from;
+    const oldTo = view?.to;
+    this.invalidateEdgeSiblingIndex();
+    if (e.directed) this.directedEdges.add(id);
+    else this.directedEdges.delete(id);
+    if (topologyChanged) {
+      this.unregisterAdj(id, oldFrom, oldTo);
+      this.registerAdj(id, e.from, e.to);
+    }
+    const edgeSiblingIndex = this.getEdgeSiblingIndex();
+    const affected = new Set<ID>([id]);
+    if (topologyChanged) {
+      for (const sid of this.pairEdges(oldFrom, oldTo)) affected.add(sid);
+      for (const sid of this.pairEdges(e.from, e.to)) affected.add(sid);
+    }
+    for (const eid of affected) this.refreshEdge(eid, edgeSiblingIndex);
     this.requestRender();
   }
 
   removeEdge(id: ID): void {
     const view = this.edgeViews.get(id);
+    this.visibilityDirty = true;
+    this.sortDirty = true;
+    this.directedEdges.delete(id);
+    this.edgeIndex.remove(id);
+    this.visibleEdgeIds.delete(id);
+    this.invalidateEdgeSiblingIndex();
     const from = view?.from;
     const to = view?.to;
     if (view) {
       this.itemLayer.removeChild(view.container);
-      view.container.destroy({ children: true });
+      destroyEdgeView(view);
       this.edgeViews.delete(id);
     }
     for (const set of this.nodeEdges.values()) set.delete(id);
-    if (from && to) for (const sid of this.pairEdges(from, to)) this.refreshEdge(sid);
+    if (from && to) {
+      const edgeSiblingIndex = this.getEdgeSiblingIndex();
+      for (const sid of this.pairEdges(from, to)) this.refreshEdge(sid, edgeSiblingIndex);
+    }
     this.requestRender();
   }
 
@@ -618,19 +973,47 @@ class Scene {
     }
   }
 
-  private refreshEdge(id: ID): void {
+  private unregisterAdj(edgeId: ID, from: ID | undefined, to: ID | undefined): void {
+    for (const nid of [from, to]) {
+      if (nid === undefined) continue;
+      const set = this.nodeEdges.get(nid);
+      if (!set) continue;
+      set.delete(edgeId);
+      if (!set.size) this.nodeEdges.delete(nid);
+    }
+  }
+
+  private refreshEdge(id: ID, edgeSiblingIndex?: EdgeSiblingIndex): void {
     const view = this.edgeViews.get(id);
     const e = doc.board.edges[id];
     if (!view || !e) return;
     const fr = e.from ? doc.board.shapes[e.from] : undefined;
     const to = e.to ? doc.board.shapes[e.to] : undefined;
-    updateEdgeView(view, e, resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e), 0, fr, to);
+    const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e, edgeSiblingIndex);
+    this.edgeIndex.upsert(id, this.boundsForEdgeGeometry(geo));
+    updateEdgeView(
+      view,
+      e,
+      geo,
+      fr,
+      to,
+    );
+    view.from = e.from;
+    view.to = e.to;
     view.epoch = this.cameraEpoch;
+    const shown = !this.isEdgeHidden(e) && this.isEdgeViewInViewport(view);
+    this.setEdgeCulled(view, !shown);
+    if (shown) this.visibleEdgeIds.add(id);
+    else this.visibleEdgeIds.delete(id);
   }
 
   // ---- bulk ----
   rebuild(): void {
     this.clear();
+    this.markBoardBoundsDirty();
+    this.visibilityDirty = true;
+    this.sortDirty = true;
+    this.pedestalBatchDirty = true;
     for (const id of doc.board.order) {
       if (doc.board.shapes[id]) this.addNode(id);
       else if (doc.board.edges[id]) this.addEdge(id);
@@ -644,11 +1027,28 @@ class Scene {
 
   private clear(): void {
     for (const v of this.nodeViews.values()) this.destroyNodeView(v);
-    for (const v of this.edgeViews.values()) v.container.destroy({ children: true });
+    for (const v of this.edgeViews.values()) destroyEdgeView(v);
     this.nodeViews.clear();
     this.edgeViews.clear();
     this.nodeEdges.clear();
+    this.directedEdges.clear();
+    this.batchableNodeIds.clear();
+    this.pedestalVisibleIds.clear();
+    this.visibleEdgeIds.clear();
+    this.shapeIndex.clear();
+    this.edgeIndex.clear();
+    this.edgeSiblingIndex = null;
+    this.pedestalBatch.clear();
+    this.pedestalBatchEpoch = -1;
+    this.pedestalBatchDirty = true;
+    this.lastBoardBounds = null;
+    this.boardBoundsCache = null;
+    this.boardBoundsDirty = true;
+    this.boardLayerDirty = true;
+    this.visibilityDirty = true;
+    this.sortDirty = true;
     this.itemLayer.removeChildren();
+    this.itemLayer.addChild(this.pedestalBatch.container);
     this.labelLayer.removeChildren();
   }
 
@@ -659,11 +1059,12 @@ class Scene {
   }
 
   // ---- hit testing (SCREEN space, elevation-aware) ----
-  // Tokens are drawn lifted off the board by their floor's elevation, so a ground
-  // footprint no longer sits under the visible token. We instead test the screen
-  // point against each token's projected TOP face (at its floor elevation), and
-  // edges against their projected path. The frontmost candidate wins — same key
-  // the painter uses: higher layer first, then nearer depth, then node-over-edge.
+  // Tokens are drawn lifted off the board by their floor elevation (+ optional
+  // within-floor stack nudge), so a ground footprint no longer sits under the
+  // visible token. We instead test the screen point against each token's
+  // projected TOP face, and edges against their projected path. The frontmost
+  // candidate wins — same key the painter uses: higher floor first, then nearer
+  // depth (lift feeds into depth), then node-over-edge.
   private isMoreFront(
     a: { layer: number; depth: number; isEdge: boolean },
     b: { layer: number; depth: number; isEdge: boolean },
@@ -721,26 +1122,103 @@ class Scene {
     return inside;
   }
 
-  hitTestShape(sp: Pt, activeOnly = false): ID | null {
-    const proj = getActiveProjector();
-    let bestId: ID | null = null;
-    let best: { layer: number; depth: number; isEdge: boolean } | null = null;
-    for (const s of Object.values(doc.board.shapes)) {
-      if (this.isFloorHidden(floorOf(s))) continue;
-      if (activeOnly && floorOf(s) !== this.activeLayer) continue;
-      if (!this.shapeHit(s, sp, proj)) continue;
-      const cand = { layer: layerOf(s), depth: depthAtBoard(proj, s.x + s.w / 2, s.y + s.h / 2, elevationOf(s) + H_PED), isEdge: false };
-      if (!best || this.isMoreFront(cand, best)) {
-        best = cand;
-        bestId = s.id;
+  private shapeCandidatesAtScreenPoint(sp: Pt, proj: Projector, tolPx: number): Shape[] {
+    const heights = [0, H_PED];
+    const seen = new Set<ID>();
+    const candidates: Shape[] = [];
+    for (const h of heights) {
+      const p = unprojectBoardAt(proj, sp.x, sp.y, h);
+      if (!p) continue;
+      const scale = Math.max(0.05, scaleAtBoard(proj, p.wx, p.wy, h));
+      const radius = Math.max(256, tolPx / scale + 256);
+      for (const shape of this.shapeIndex.queryPoint(p.wx, p.wy, radius)) {
+        if (seen.has(shape.id)) continue;
+        seen.add(shape.id);
+        candidates.push(shape);
       }
     }
-    return bestId;
+    return candidates.length ? candidates : this.shapeIndex.all();
+  }
+
+  private shapeCandidatesInScreenRect(
+    x0: number,
+    y0: number,
+    x1: number,
+    y1: number,
+    proj: Projector,
+  ): Shape[] {
+    const rx0 = Math.min(x0, x1);
+    const ry0 = Math.min(y0, y1);
+    const rx1 = Math.max(x0, x1);
+    const ry1 = Math.max(y0, y1);
+    const heights = [0, H_PED];
+    const points: Array<{ wx: number; wy: number }> = [];
+    for (const h of heights) {
+      for (const [sx, sy] of [
+        [rx0, ry0],
+        [rx1, ry0],
+        [rx1, ry1],
+        [rx0, ry1],
+      ] as Array<[number, number]>) {
+        const p = unprojectBoardAt(proj, sx, sy, h);
+        if (p) points.push(p);
+      }
+    }
+    if (points.length < 4) return this.shapeIndex.all();
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const p of points) {
+      minX = Math.min(minX, p.wx);
+      minY = Math.min(minY, p.wy);
+      maxX = Math.max(maxX, p.wx);
+      maxY = Math.max(maxY, p.wy);
+    }
+    return this.shapeIndex.queryRect({ minX, minY, maxX, maxY });
+  }
+
+  hitTestShape(sp: Pt, activeOnly = false): ID | null {
+    const start = performance.now();
+    try {
+      const proj = getActiveProjector();
+      let bestId: ID | null = null;
+      let best: { layer: number; depth: number; isEdge: boolean } | null = null;
+      for (const s of this.shapeCandidatesAtScreenPoint(sp, proj, 8)) {
+        if (this.isFloorHidden(floorOf(s))) continue;
+        if (activeOnly && floorOf(s) !== this.activeLayer) continue;
+        if (!this.shapeHit(s, sp, proj)) continue;
+        const cand = { layer: layerOf(s), depth: depthAtBoard(proj, s.x + s.w / 2, s.y + s.h / 2, elevationOf(s) + H_PED), isEdge: false };
+        if (!best || this.isMoreFront(cand, best)) {
+          best = cand;
+          bestId = s.id;
+        }
+      }
+      return bestId;
+    } finally {
+      this.hitTestMsSinceLastFrame += performance.now() - start;
+    }
   }
 
   /** Min screen-px distance from `sp` to an edge's projected path (at its draw height). */
-  private edgeScreenDist(e: Edge, sp: Pt, proj: Projector): number {
-    const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e);
+  private edgeScreenDist(
+    e: Edge,
+    sp: Pt,
+    proj: Projector,
+    edgeSiblingIndex?: EdgeSiblingIndex,
+    view?: EdgeView,
+  ): number {
+    if (view?.epoch === this.cameraEpoch && view.screenPath.length >= 2) {
+      let best = Infinity;
+      for (let i = 0; i < view.screenPath.length - 1; i++) {
+        const a = view.screenPath[i];
+        const b = view.screenPath[i + 1];
+        const d = distToSegment(sp, { x: a.sx, y: a.sy }, { x: b.sx, y: b.sy });
+        if (d < best) best = d;
+      }
+      return best;
+    }
+    const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e, edgeSiblingIndex);
     const from = e.from ? doc.board.shapes[e.from] : undefined;
     const to = e.to ? doc.board.shapes[e.to] : undefined;
     // Match reprojectEdgeView exactly: each end rides its node's floor, a free
@@ -766,53 +1244,74 @@ class Scene {
 
   /** Frontmost selectable target under SCREEN point `sp`, honoring the layer/depth paint order. */
   hitTestTop(sp: Pt, tolPx: number, activeOnly = false): { kind: "shape" | "edge"; id: ID } | null {
-    const proj = getActiveProjector();
-    let result: { kind: "shape" | "edge"; id: ID } | null = null;
-    let best: { layer: number; depth: number; isEdge: boolean } | null = null;
-    for (const s of Object.values(doc.board.shapes)) {
-      if (this.isFloorHidden(floorOf(s))) continue;
-      if (activeOnly && floorOf(s) !== this.activeLayer) continue;
-      if (!this.shapeHit(s, sp, proj)) continue;
-      const cand = { layer: layerOf(s), depth: depthAtBoard(proj, s.x + s.w / 2, s.y + s.h / 2, elevationOf(s) + H_PED), isEdge: false };
-      if (!best || this.isMoreFront(cand, best)) {
-        best = cand;
-        result = { kind: "shape", id: s.id };
+    const start = performance.now();
+    try {
+      const proj = getActiveProjector();
+      let result: { kind: "shape" | "edge"; id: ID } | null = null;
+      let best: { layer: number; depth: number; isEdge: boolean } | null = null;
+      for (const s of this.shapeCandidatesAtScreenPoint(sp, proj, tolPx)) {
+        if (this.isFloorHidden(floorOf(s))) continue;
+        if (activeOnly && floorOf(s) !== this.activeLayer) continue;
+        if (!this.shapeHit(s, sp, proj)) continue;
+        const cand = { layer: layerOf(s), depth: depthAtBoard(proj, s.x + s.w / 2, s.y + s.h / 2, elevationOf(s) + H_PED), isEdge: false };
+        if (!best || this.isMoreFront(cand, best)) {
+          best = cand;
+          result = { kind: "shape", id: s.id };
+        }
       }
-    }
-    for (const e of Object.values(doc.board.edges)) {
-      if (this.isEdgeHidden(e)) continue;
-      if (this.edgeScreenDist(e, sp, proj) > tolPx) continue;
-      const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e);
-      const depth = Math.min(
-        depthAtBoard(proj, geo.p1.x, geo.p1.y, 0),
-        depthAtBoard(proj, geo.p2.x, geo.p2.y, 0),
-      );
-      const cand = { layer: this.edgeLayer(e), depth, isEdge: true };
-      if (!best || this.isMoreFront(cand, best)) {
-        best = cand;
-        result = { kind: "edge", id: e.id };
+      const edgeSiblingIndex = this.getEdgeSiblingIndex();
+      for (const id of this.visibleEdgeIds) {
+        const e = doc.board.edges[id];
+        const view = this.edgeViews.get(id);
+        if (!e || !view || view.culled || this.isEdgeHidden(e)) continue;
+        const b = view?.screenBounds;
+        if (
+          b &&
+          (sp.x < b.minX - tolPx ||
+            sp.x > b.maxX + tolPx ||
+            sp.y < b.minY - tolPx ||
+            sp.y > b.maxY + tolPx)
+        ) {
+          continue;
+        }
+        if (this.edgeScreenDist(e, sp, proj, edgeSiblingIndex, view) > tolPx) continue;
+        const geo = resolveEdgeGeometry(doc.board.edges, doc.board.shapes, e, edgeSiblingIndex);
+        const depth = Math.min(
+          depthAtBoard(proj, geo.p1.x, geo.p1.y, 0),
+          depthAtBoard(proj, geo.p2.x, geo.p2.y, 0),
+        );
+        const cand = { layer: this.edgeLayer(e), depth, isEdge: true };
+        if (!best || this.isMoreFront(cand, best)) {
+          best = cand;
+          result = { kind: "edge", id: e.id };
+        }
       }
+      return result;
+    } finally {
+      this.hitTestMsSinceLastFrame += performance.now() - start;
     }
-    return result;
   }
 
   /** Shapes whose projected token center falls inside a SCREEN-space marquee rect. */
   shapesInScreenRect(x0: number, y0: number, x1: number, y1: number, activeOnly = false): ID[] {
-    const rx0 = Math.min(x0, x1);
-    const ry0 = Math.min(y0, y1);
-    const rx1 = Math.max(x0, x1);
-    const ry1 = Math.max(y0, y1);
-    const proj = getActiveProjector();
-    const out: ID[] = [];
-    for (const id of doc.board.order) {
-      const s = doc.board.shapes[id];
-      if (!s) continue;
-      if (this.isFloorHidden(floorOf(s))) continue;
-      if (activeOnly && floorOf(s) !== this.activeLayer) continue;
-      const c = projectBoard(proj, s.x + s.w / 2, s.y + s.h / 2, elevationOf(s) + H_PED);
-      if (c.ok && c.sx >= rx0 && c.sx <= rx1 && c.sy >= ry0 && c.sy <= ry1) out.push(id);
+    const start = performance.now();
+    try {
+      const rx0 = Math.min(x0, x1);
+      const ry0 = Math.min(y0, y1);
+      const rx1 = Math.max(x0, x1);
+      const ry1 = Math.max(y0, y1);
+      const proj = getActiveProjector();
+      const out: ID[] = [];
+      for (const s of this.shapeCandidatesInScreenRect(x0, y0, x1, y1, proj)) {
+        if (this.isFloorHidden(floorOf(s))) continue;
+        if (activeOnly && floorOf(s) !== this.activeLayer) continue;
+        const c = projectBoard(proj, s.x + s.w / 2, s.y + s.h / 2, elevationOf(s) + H_PED);
+        if (c.ok && c.sx >= rx0 && c.sx <= rx1 && c.sy >= ry0 && c.sy <= ry1) out.push(s.id);
+      }
+      return out;
+    } finally {
+      this.hitTestMsSinceLastFrame += performance.now() - start;
     }
-    return out;
   }
 
   exportThumbnail(): string | undefined {
@@ -846,6 +1345,8 @@ class Scene {
     for (const bd of this.floorBadges) bd.texture?.destroy(true);
     this.floorBadges = [];
     this.activeLayer = 0;
+    this.itemLayer.removeChild(this.pedestalBatch.container);
+    this.pedestalBatch.destroy();
     this.app.destroy(true, { children: true });
   }
 }

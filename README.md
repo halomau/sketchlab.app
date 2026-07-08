@@ -21,6 +21,24 @@ npm run build     # type-check + production build to dist/
 npm run preview   # serve the production build
 ```
 
+## Claude Code skill (generate diagrams into Sketch Lab)
+
+Agents can emit Sketch Lab `GeneratedGraph` JSON and open it with a `?g=` URL.
+The skill is hosted with the app:
+
+- Skill file: https://sketchlab.webdevcody.com/skills/sketch-lab/SKILL.md
+
+Install into Claude Code:
+
+```bash
+mkdir -p ~/.claude/skills/sketch-lab
+curl -fsSL https://sketchlab.webdevcody.com/skills/sketch-lab/SKILL.md \
+  -o ~/.claude/skills/sketch-lab/SKILL.md
+```
+
+Then restart Claude Code and ask for a Sketch Lab diagram. The agent builds
+`https://sketchlab.webdevcody.com/?g=<uri-encoded-json>` and opens it.
+
 ## How performance is kept flat with many shapes
 
 - **Dirty-set updates, not full diffs.** Actions mutate the nanostore *and* tell the
@@ -44,7 +62,7 @@ src/
                 text-editor overlay, "/" icon palette
   persistence/  IndexedDB (db.ts), autosave, URL share encode/decode
   ui/           dashboard, editor chrome (toolbar/colors/zoom), DOM helpers, router
-  main.ts       hash router: dashboard (#/) ↔ editor (#/board/:id), ?b= shared import
+  main.ts       hash router: editor (#/board/:id), ?b= board share, ?g= GeneratedGraph import
 ```
 
 ## Shortcuts

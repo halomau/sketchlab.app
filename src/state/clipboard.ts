@@ -2,7 +2,7 @@ import type { Pt } from "../render/geometry";
 import { scene } from "../render/scene";
 import { uid } from "../util";
 import { deleteSelection } from "./actions";
-import { $selection, bumpRevision, doc, setSelection } from "./store";
+import { $activeLayer, $selection, bumpRevision, doc, setSelection } from "./store";
 import type { Edge, Shape } from "./types";
 
 const PASTE_OFFSET = 24;
@@ -98,12 +98,24 @@ export function pasteClipboard(at?: Pt): void {
     dx = dy = PASTE_OFFSET * pasteCount;
   }
 
+  // Rebase the paste onto the active floor: shift every copied item by the gap
+  // between the active layer and the clipboard's lowest layer. A single-floor
+  // copy lands entirely on the selected floor; a multi-floor copy keeps its
+  // relative stacking. Free-floating edges (no copied shape) carry their own layer.
+  let minLayer = Infinity;
+  for (const s of clipShapes) minLayer = Math.min(minLayer, s.layer ?? 0);
+  for (const e of clipEdges) {
+    if (e.from === undefined && e.to === undefined) minLayer = Math.min(minLayer, e.layer ?? 0);
+  }
+  const layerDelta = Number.isFinite(minLayer) ? $activeLayer.get() - minLayer : 0;
+  const rebaseLayer = (layer: number | undefined): number => Math.max(0, (layer ?? 0) + layerDelta);
+
   const idMap = new Map<string, string>();
   const newShapeIds: string[] = [];
   for (const s of clipShapes) {
     const nid = uid();
     idMap.set(s.id, nid);
-    doc.board.shapes[nid] = { ...s, id: nid, x: s.x + dx, y: s.y + dy };
+    doc.board.shapes[nid] = { ...s, id: nid, x: s.x + dx, y: s.y + dy, layer: rebaseLayer(s.layer) };
     doc.board.order.push(nid);
     scene.addNode(nid);
     newShapeIds.push(nid);
@@ -129,7 +141,7 @@ export function pasteClipboard(at?: Pt): void {
     if (skip) continue;
 
     const nid = uid();
-    const clone: Edge = { ...e, id: nid, from, to };
+    const clone: Edge = { ...e, id: nid, from, to, layer: rebaseLayer(e.layer) };
     // free endpoints move with the pasted copy so it doesn't sit on the original
     if (clone.from === undefined && clone.x1 !== undefined && clone.y1 !== undefined) {
       clone.x1 += dx;

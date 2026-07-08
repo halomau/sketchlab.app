@@ -2,3 +2,9 @@ node_modules
 dist
 *.local
 .DS_Store
+
+# Mission Control Recall (code graph MCP) — machine-specific, do not commit
+.mcp.json
+
+# Mission Control Recall (project memory) — private, do not commit
+CLAUDE.local.md

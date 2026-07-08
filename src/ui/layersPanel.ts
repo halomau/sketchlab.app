@@ -8,7 +8,7 @@ import {
 } from "../render/shading";
 import * as actions from "../state/actions";
 import { $activeLayer, $floorSpacing, $layerFade, $revision, $selection, doc } from "../state/store";
-import { confirmDialog } from "./confirmDialog";
+import { choiceDialog, confirmDialog } from "./confirmDialog";
 import { h, toast } from "./dom";
 import { createSwatchPicker, LAYER_ACCENTS } from "./swatchPicker";
 
@@ -366,12 +366,27 @@ export class LayersPanel {
         disabled: total > 1 ? undefined : true,
         onclick: async (e: Event) => {
           e.stopPropagation();
-          const ok = await confirmDialog({
+          // an empty floor has nothing to drop/purge — a plain confirm suffices
+          if (row.count === 0) {
+            const ok = await confirmDialog({
+              title: "Delete floor",
+              message: `Delete "${row.name}"?`,
+            });
+            if (ok) actions.deleteLayer(i, "drop");
+            return;
+          }
+          const items = `${row.count} item${row.count === 1 ? "" : "s"}`;
+          const choice = await choiceDialog({
             title: "Delete floor",
-            message: `Delete "${row.name}"? Shapes on it drop to the floor below.`,
+            message: `Delete "${row.name}"? It has ${items}. Drop them to the floor below, or delete them along with the floor?`,
+            dismissId: "cancel",
+            options: [
+              { id: "cancel", label: "Cancel", variant: "ghost" },
+              { id: "drop", label: "Drop shapes below", variant: "primary" },
+              { id: "purge", label: "Delete shapes too", variant: "danger" },
+            ],
           });
-          if (!ok) return;
-          actions.deleteLayer(i);
+          if (choice === "drop" || choice === "purge") actions.deleteLayer(i, choice);
         },
       },
       "🗑",

@@ -1,5 +1,7 @@
+import { center, type Pt, reanchorBend } from "../render/geometry";
 import { measureTextBox } from "../render/measure";
 import { scene } from "../render/scene";
+import { STACK_STEP } from "../render/shading";
 import { uid } from "../util";
 import { computeAutoLayoutEdgeBends, computeAutoLayoutPositions, isFullyAnchoredEdge } from "./autoLayout";
 import {
@@ -14,6 +16,22 @@ import {
 import type { Board, Edge, ID, LayerDef, Shape, ShapeKind } from "./types";
 
 export const DEFAULT_SIZE = 110;
+
+/**
+ * Diameter used when click-placing a circle or dropping an icon token.
+ * Averages existing disc tokens (circle + icon) via `min(w,h)`, falling
+ * back to {@link DEFAULT_SIZE} when the board has none yet.
+ */
+export function averageCircleSize(): number {
+  let sum = 0;
+  let n = 0;
+  for (const s of Object.values(doc.board.shapes)) {
+    if (s.kind !== "circle" && s.kind !== "icon") continue;
+    sum += Math.min(s.w, s.h);
+    n++;
+  }
+  return n === 0 ? DEFAULT_SIZE : sum / n;
+}
 
 /**
  * Ensure `order` lists every shape and edge exactly once. Legacy boards stored
@@ -160,15 +178,74 @@ export function updateShape(id: ID, patch: Partial<Shape>): void {
   bumpRevision();
 }
 
-export function moveShapesBy(ids: Iterable<ID>, dx: number, dy: number): void {
-  for (const id of ids) {
+/**
+ * Translate a drag selection by (dx,dy). Moved shapes carry their anchored
+ * edges; selected free-ended edges carry their free endpoints. Manual bends
+ * (edge.cx/cy) follow their endpoints instead of staying pinned in world
+ * space: a rigid move translates the bend, while a one-ended move re-anchors
+ * it relative to the chord so the label rides the curve and a stretched edge
+ * relaxes toward a straight line.
+ */
+export function moveSelectionBy(
+  shapeIds: Iterable<ID>,
+  edgeIds: Iterable<ID>,
+  dx: number,
+  dy: number,
+): void {
+  const movedShapes = new Set<ID>();
+  for (const id of shapeIds) {
     const s = doc.board.shapes[id];
     if (!s) continue;
     s.x += dx;
     s.y += dy;
+    movedShapes.add(id);
     scene.updateNode(id);
   }
-  bumpRevision();
+
+  const selectedEdges = new Set<ID>();
+  for (const id of edgeIds) if (doc.board.edges[id]) selectedEdges.add(id);
+
+  let changed = movedShapes.size > 0;
+  for (const e of Object.values(doc.board.edges)) {
+    // an end moves when its anchor shape moved, or it floats free and the edge
+    // itself is part of the drag selection
+    const fromMoves = e.from !== undefined ? movedShapes.has(e.from) : selectedEdges.has(e.id);
+    const toMoves = e.to !== undefined ? movedShapes.has(e.to) : selectedEdges.has(e.id);
+    if (!fromMoves && !toMoves) continue;
+    if (e.from === undefined && fromMoves && e.x1 !== undefined && e.y1 !== undefined) {
+      e.x1 += dx;
+      e.y1 += dy;
+    }
+    if (e.to === undefined && toMoves && e.x2 !== undefined && e.y2 !== undefined) {
+      e.x2 += dx;
+      e.y2 += dy;
+    }
+    if (e.cx !== undefined && e.cy !== undefined) {
+      if (fromMoves && toMoves) {
+        e.cx += dx;
+        e.cy += dy;
+      } else {
+        const a = edgeEndCenter(e.from, e.x1, e.y1);
+        const b = edgeEndCenter(e.to, e.x2, e.y2);
+        // ends already hold post-move positions; back out the delta for the
+        // moved end to recover the chord the bend was set against
+        const oldA = fromMoves ? { x: a.x - dx, y: a.y - dy } : a;
+        const oldB = toMoves ? { x: b.x - dx, y: b.y - dy } : b;
+        const p = reanchorBend({ x: e.cx, y: e.cy }, oldA, oldB, a, b);
+        e.cx = p.x;
+        e.cy = p.y;
+      }
+    }
+    scene.updateEdge(e.id);
+    changed = true;
+  }
+  if (changed) bumpRevision();
+}
+
+/** Where an edge end "aims from": its anchor shape's center or its free point. */
+function edgeEndCenter(id: ID | undefined, fx: number | undefined, fy: number | undefined): Pt {
+  const s = id !== undefined ? doc.board.shapes[id] : undefined;
+  return s ? center(s) : { x: fx ?? 0, y: fy ?? 0 };
 }
 
 export function setShapesStyle(
@@ -234,25 +311,65 @@ export function deleteShape(id: ID): void {
 }
 
 // ---------------------------------------------------------------------------
-// Layering in 3D. Paint order is driven by each shape's integer `layer`, which
-// renders as a world-up elevation (a higher layer lifts the token off the board
-// toward the viewer = "front"; a lower layer sinks it = "back"). These actions
-// move the selected shapes up/down through layers; the renderer re-sorts and
-// re-elevates from the new value.
+// Within-floor stacking. Bring/Send Front/Back nudge a shape's `lift` by a few
+// world-up units so overlapping tokens on the same named floor separate for
+// paint order and hit-testing — without jumping to another floor (that's what
+// "Move to …" / the layers panel is for). Named-floor assignment still goes
+// through `applyLayer` below.
 // ---------------------------------------------------------------------------
 
-/** Highest (`pick=max`) or lowest (`pick=min`) layer among shapes NOT in `ids`. */
-function boundaryLayer(ids: Set<ID>, pick: "max" | "min"): number {
+/** Highest (`pick=max`) or lowest (`pick=min`) lift among same-floor peers NOT in `ids`. */
+function boundaryLift(ids: Set<ID>, floor: number, pick: "max" | "min"): number {
   let best = pick === "max" ? -Infinity : Infinity;
   for (const [id, s] of Object.entries(doc.board.shapes)) {
     if (ids.has(id)) continue;
-    const L = s.layer ?? 0;
+    if ((s.layer ?? 0) !== floor) continue;
+    const L = s.lift ?? 0;
     best = pick === "max" ? Math.max(best, L) : Math.min(best, L);
   }
   return Number.isFinite(best) ? best : 0;
 }
 
-/** Set each selected shape's layer via `next`, redraw it, and persist if changed. */
+/** Set each selected shape's within-floor lift via `next`, redraw, and persist. */
+function applyLift(ids: Iterable<ID>, next: (cur: number, floor: number) => number): void {
+  let changed = false;
+  for (const id of new Set(ids)) {
+    const s = doc.board.shapes[id];
+    if (!s) continue;
+    const cur = s.lift ?? 0;
+    const nl = next(cur, s.layer ?? 0);
+    if (nl === cur) continue;
+    if (nl === 0) delete s.lift;
+    else s.lift = nl;
+    scene.updateNode(id); // re-elevate the pedestal + refresh connected edges
+    changed = true;
+  }
+  if (changed) bumpRevision();
+}
+
+/** Nudge the selection just above every peer on the same floor. */
+export function bringToFront(ids: Iterable<ID>): void {
+  const set = new Set(ids);
+  applyLift(set, (_cur, floor) => boundaryLift(set, floor, "max") + STACK_STEP);
+}
+
+/** Nudge the selection just below every peer on the same floor. */
+export function sendToBack(ids: Iterable<ID>): void {
+  const set = new Set(ids);
+  applyLift(set, (_cur, floor) => boundaryLift(set, floor, "min") - STACK_STEP);
+}
+
+/** Raise the selection one small stack step toward the viewer. */
+export function bringForward(ids: Iterable<ID>): void {
+  applyLift(ids, (cur) => cur + STACK_STEP);
+}
+
+/** Lower the selection one small stack step away from the viewer. */
+export function sendBackward(ids: Iterable<ID>): void {
+  applyLift(ids, (cur) => cur - STACK_STEP);
+}
+
+/** Set each selected shape's named floor via `next`, redraw it, and persist if changed. */
 function applyLayer(ids: Iterable<ID>, next: (cur: number) => number): void {
   let changed = false;
   for (const id of new Set(ids)) {
@@ -266,30 +383,6 @@ function applyLayer(ids: Iterable<ID>, next: (cur: number) => number): void {
     changed = true;
   }
   if (changed) bumpRevision();
-}
-
-/** Lift the selection above every other shape (drawn on top / nearest the viewer). */
-export function bringToFront(ids: Iterable<ID>): void {
-  const set = new Set(ids);
-  const target = boundaryLayer(set, "max") + 1;
-  applyLayer(set, () => target);
-}
-
-/** Sink the selection below every other shape (drawn behind everything). */
-export function sendToBack(ids: Iterable<ID>): void {
-  const set = new Set(ids);
-  const target = boundaryLayer(set, "min") - 1;
-  applyLayer(set, () => target);
-}
-
-/** Raise the selection one layer toward the viewer. */
-export function bringForward(ids: Iterable<ID>): void {
-  applyLayer(ids, (cur) => cur + 1);
-}
-
-/** Lower the selection one layer away from the viewer. */
-export function sendBackward(ids: Iterable<ID>): void {
-  applyLayer(ids, (cur) => cur - 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -346,14 +439,41 @@ export function setLayerColor(index: number, color: string): void {
   bumpRevision(); // refresh the layers panel row swatches
 }
 
-/** Remove a floor: shapes on it drop to the floor below, higher shapes re-index down. */
-export function deleteLayer(index: number): void {
+/**
+ * Remove a floor. `mode` controls what happens to the shapes sitting on it:
+ * - "drop" (default): they fall to the floor below; higher shapes re-index down.
+ * - "purge": they are deleted along with the floor (with their connected edges),
+ *   as are any free-floating edges that lived on it.
+ */
+export function deleteLayer(index: number, mode: "drop" | "purge" = "drop"): void {
   const layers = doc.board.layers;
   if (!layers || index < 0 || index >= layers.length) return;
+
+  if (mode === "purge") {
+    // deleteShape also removes each shape's connected edges (Object.values is a
+    // snapshot, so deleting during iteration is safe)
+    for (const s of Object.values(doc.board.shapes)) {
+      if ((s.layer ?? 0) === index) deleteShape(s.id);
+    }
+    // drop free-floating edges (no anchored end) that float on this floor
+    const freeOnFloor = Object.values(doc.board.edges).filter(
+      (e) => e.from === undefined && e.to === undefined && (e.layer ?? 0) === index,
+    );
+    if (freeOnFloor.length) {
+      const removed = new Set<ID>();
+      for (const e of freeOnFloor) {
+        delete doc.board.edges[e.id];
+        scene.removeEdge(e.id);
+        removed.add(e.id);
+      }
+      doc.board.order = doc.board.order.filter((x) => !removed.has(x));
+    }
+  }
+
   layers.splice(index, 1);
   for (const s of Object.values(doc.board.shapes)) {
     const l = s.layer ?? 0;
-    if (l === index) s.layer = Math.max(0, index - 1);
+    if (l === index) s.layer = Math.max(0, index - 1); // only survivors in "drop" mode
     else if (l > index) s.layer = l - 1;
     scene.updateNode(s.id);
   }
@@ -533,36 +653,6 @@ export function createFreeEdge(opts: {
   scene.addEdge(edge.id);
   bumpRevision();
   return edge;
-}
-
-/**
- * Translate the free parts of edges by (dx,dy): free endpoints and any manual
- * bend. Shape-anchored ends are left alone — they follow their shapes — so a
- * fully-connected edge is a no-op here.
- */
-export function moveEdgesBy(ids: Iterable<ID>, dx: number, dy: number): void {
-  let changed = false;
-  for (const id of ids) {
-    const e = doc.board.edges[id];
-    if (!e) continue;
-    const hasFreeEnd = e.from === undefined || e.to === undefined;
-    if (!hasFreeEnd) continue;
-    if (e.from === undefined && e.x1 !== undefined && e.y1 !== undefined) {
-      e.x1 += dx;
-      e.y1 += dy;
-    }
-    if (e.to === undefined && e.x2 !== undefined && e.y2 !== undefined) {
-      e.x2 += dx;
-      e.y2 += dy;
-    }
-    if (e.cx !== undefined && e.cy !== undefined) {
-      e.cx += dx;
-      e.cy += dy;
-    }
-    scene.updateEdge(id);
-    changed = true;
-  }
-  if (changed) bumpRevision();
 }
 
 export function updateEdge(id: ID, patch: Partial<Edge>): void {
