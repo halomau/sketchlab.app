@@ -79,6 +79,41 @@ export function quadPoints(a: Pt, ctrl: Pt, b: Pt, n = 12): Pt[] {
   return out;
 }
 
+/**
+ * Re-anchor a manual bend after its endpoints move: preserve the control
+ * point's position relative to the chord (fraction along it plus signed
+ * perpendicular offset) instead of its absolute world position, so the bend —
+ * and the label riding it — follows the nodes. The offset stays constant in
+ * world units and is capped at half the chord, so pulling nodes far apart
+ * flattens the curve toward a straight line instead of ballooning it.
+ */
+export function reanchorBend(bend: Pt, oldA: Pt, oldB: Pt, newA: Pt, newB: Pt): Pt {
+  const odx = oldB.x - oldA.x;
+  const ody = oldB.y - oldA.y;
+  const oldLen = Math.hypot(odx, ody);
+  const ndx = newB.x - newA.x;
+  const ndy = newB.y - newA.y;
+  const newLen = Math.hypot(ndx, ndy);
+  if (oldLen < 1e-3 || newLen < 1e-3) {
+    // degenerate chord: carry the bend with the average endpoint motion
+    return {
+      x: bend.x + (newA.x - oldA.x + newB.x - oldB.x) / 2,
+      y: bend.y + (newA.y - oldA.y + newB.y - oldB.y) / 2,
+    };
+  }
+  const wx = bend.x - oldA.x;
+  const wy = bend.y - oldA.y;
+  let t = (wx * odx + wy * ody) / (oldLen * oldLen);
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  const d = (odx * wy - ody * wx) / oldLen;
+  const maxD = newLen / 2;
+  const dd = d > maxD ? maxD : d < -maxD ? -maxD : d;
+  return {
+    x: newA.x + ndx * t + (-ndy / newLen) * dd,
+    y: newA.y + ndy * t + (ndx / newLen) * dd,
+  };
+}
+
 /** Resolved endpoints + control + label anchor for an edge. */
 export interface EdgeGeometry {
   p1: Pt;

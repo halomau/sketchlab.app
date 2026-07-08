@@ -1,3 +1,4 @@
+import { center, type Pt, reanchorBend } from "../render/geometry";
 import { measureTextBox } from "../render/measure";
 import { scene } from "../render/scene";
 import { uid } from "../util";
@@ -160,15 +161,74 @@ export function updateShape(id: ID, patch: Partial<Shape>): void {
   bumpRevision();
 }
 
-export function moveShapesBy(ids: Iterable<ID>, dx: number, dy: number): void {
-  for (const id of ids) {
+/**
+ * Translate a drag selection by (dx,dy). Moved shapes carry their anchored
+ * edges; selected free-ended edges carry their free endpoints. Manual bends
+ * (edge.cx/cy) follow their endpoints instead of staying pinned in world
+ * space: a rigid move translates the bend, while a one-ended move re-anchors
+ * it relative to the chord so the label rides the curve and a stretched edge
+ * relaxes toward a straight line.
+ */
+export function moveSelectionBy(
+  shapeIds: Iterable<ID>,
+  edgeIds: Iterable<ID>,
+  dx: number,
+  dy: number,
+): void {
+  const movedShapes = new Set<ID>();
+  for (const id of shapeIds) {
     const s = doc.board.shapes[id];
     if (!s) continue;
     s.x += dx;
     s.y += dy;
+    movedShapes.add(id);
     scene.updateNode(id);
   }
-  bumpRevision();
+
+  const selectedEdges = new Set<ID>();
+  for (const id of edgeIds) if (doc.board.edges[id]) selectedEdges.add(id);
+
+  let changed = movedShapes.size > 0;
+  for (const e of Object.values(doc.board.edges)) {
+    // an end moves when its anchor shape moved, or it floats free and the edge
+    // itself is part of the drag selection
+    const fromMoves = e.from !== undefined ? movedShapes.has(e.from) : selectedEdges.has(e.id);
+    const toMoves = e.to !== undefined ? movedShapes.has(e.to) : selectedEdges.has(e.id);
+    if (!fromMoves && !toMoves) continue;
+    if (e.from === undefined && fromMoves && e.x1 !== undefined && e.y1 !== undefined) {
+      e.x1 += dx;
+      e.y1 += dy;
+    }
+    if (e.to === undefined && toMoves && e.x2 !== undefined && e.y2 !== undefined) {
+      e.x2 += dx;
+      e.y2 += dy;
+    }
+    if (e.cx !== undefined && e.cy !== undefined) {
+      if (fromMoves && toMoves) {
+        e.cx += dx;
+        e.cy += dy;
+      } else {
+        const a = edgeEndCenter(e.from, e.x1, e.y1);
+        const b = edgeEndCenter(e.to, e.x2, e.y2);
+        // ends already hold post-move positions; back out the delta for the
+        // moved end to recover the chord the bend was set against
+        const oldA = fromMoves ? { x: a.x - dx, y: a.y - dy } : a;
+        const oldB = toMoves ? { x: b.x - dx, y: b.y - dy } : b;
+        const p = reanchorBend({ x: e.cx, y: e.cy }, oldA, oldB, a, b);
+        e.cx = p.x;
+        e.cy = p.y;
+      }
+    }
+    scene.updateEdge(e.id);
+    changed = true;
+  }
+  if (changed) bumpRevision();
+}
+
+/** Where an edge end "aims from": its anchor shape's center or its free point. */
+function edgeEndCenter(id: ID | undefined, fx: number | undefined, fy: number | undefined): Pt {
+  const s = id !== undefined ? doc.board.shapes[id] : undefined;
+  return s ? center(s) : { x: fx ?? 0, y: fy ?? 0 };
 }
 
 export function setShapesStyle(
@@ -532,36 +592,6 @@ export function createFreeEdge(opts: {
   scene.addEdge(edge.id);
   bumpRevision();
   return edge;
-}
-
-/**
- * Translate the free parts of edges by (dx,dy): free endpoints and any manual
- * bend. Shape-anchored ends are left alone — they follow their shapes — so a
- * fully-connected edge is a no-op here.
- */
-export function moveEdgesBy(ids: Iterable<ID>, dx: number, dy: number): void {
-  let changed = false;
-  for (const id of ids) {
-    const e = doc.board.edges[id];
-    if (!e) continue;
-    const hasFreeEnd = e.from === undefined || e.to === undefined;
-    if (!hasFreeEnd) continue;
-    if (e.from === undefined && e.x1 !== undefined && e.y1 !== undefined) {
-      e.x1 += dx;
-      e.y1 += dy;
-    }
-    if (e.to === undefined && e.x2 !== undefined && e.y2 !== undefined) {
-      e.x2 += dx;
-      e.y2 += dy;
-    }
-    if (e.cx !== undefined && e.cy !== undefined) {
-      e.cx += dx;
-      e.cy += dy;
-    }
-    scene.updateEdge(id);
-    changed = true;
-  }
-  if (changed) bumpRevision();
 }
 
 export function updateEdge(id: ID, patch: Partial<Edge>): void {

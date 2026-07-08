@@ -515,8 +515,7 @@ export class Controller {
         const dx = world.x - g.lastWX;
         const dy = world.y - g.lastWY;
         const selNow = $selection.get();
-        actions.moveShapesBy(selNow.shapes, dx, dy);
-        actions.moveEdgesBy(selNow.edges, dx, dy);
+        actions.moveSelectionBy(selNow.shapes, selNow.edges, dx, dy);
         g.lastWX = world.x;
         g.lastWY = world.y;
         g.moved = true;
