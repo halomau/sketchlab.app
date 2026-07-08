@@ -1,3 +1,4 @@
+import { DEFAULT_TEXT_FONT_SIZE } from "./style";
 import type { Board, Edge, ID, Shape } from "./types";
 
 export interface LayoutPosition {
@@ -63,7 +64,7 @@ function orderedShapeIds(board: ShapeMap): ID[] {
 
 function estimatedLabelWidth(edge: Edge): number {
   if (!edge.label) return 0;
-  const fontSize = edge.fontSize ?? 16;
+  const fontSize = edge.fontSize ?? DEFAULT_TEXT_FONT_SIZE;
   return Math.ceil(
     edge.label.length * fontSize * 0.68 +
     Math.max(0, edge.label.length - 1) * LABEL_TRACKING +
@@ -73,7 +74,7 @@ function estimatedLabelWidth(edge: Edge): number {
 
 function estimatedLabelHeight(edge: Edge): number {
   if (!edge.label) return 0;
-  const fontSize = edge.fontSize ?? 16;
+  const fontSize = edge.fontSize ?? DEFAULT_TEXT_FONT_SIZE;
   return Math.ceil(fontSize * 1.2 + 10);
 }
 

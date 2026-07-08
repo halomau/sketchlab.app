@@ -1,6 +1,7 @@
 import { center, type Pt, reanchorBend } from "../render/geometry";
 import { measureTextBox } from "../render/measure";
 import { scene } from "../render/scene";
+import { STACK_STEP } from "../render/shading";
 import { uid } from "../util";
 import { computeAutoLayoutEdgeBends, computeAutoLayoutPositions, isFullyAnchoredEdge } from "./autoLayout";
 import {
@@ -15,6 +16,22 @@ import {
 import type { Board, Edge, ID, LayerDef, Shape, ShapeKind } from "./types";
 
 export const DEFAULT_SIZE = 110;
+
+/**
+ * Diameter used when click-placing a circle or dropping an icon token.
+ * Averages existing disc tokens (circle + icon) via `min(w,h)`, falling
+ * back to {@link DEFAULT_SIZE} when the board has none yet.
+ */
+export function averageCircleSize(): number {
+  let sum = 0;
+  let n = 0;
+  for (const s of Object.values(doc.board.shapes)) {
+    if (s.kind !== "circle" && s.kind !== "icon") continue;
+    sum += Math.min(s.w, s.h);
+    n++;
+  }
+  return n === 0 ? DEFAULT_SIZE : sum / n;
+}
 
 /**
  * Ensure `order` lists every shape and edge exactly once. Legacy boards stored
@@ -294,25 +311,65 @@ export function deleteShape(id: ID): void {
 }
 
 // ---------------------------------------------------------------------------
-// Layering in 3D. Paint order is driven by each shape's integer `layer`, which
-// renders as a world-up elevation (a higher layer lifts the token off the board
-// toward the viewer = "front"; a lower layer sinks it = "back"). These actions
-// move the selected shapes up/down through layers; the renderer re-sorts and
-// re-elevates from the new value.
+// Within-floor stacking. Bring/Send Front/Back nudge a shape's `lift` by a few
+// world-up units so overlapping tokens on the same named floor separate for
+// paint order and hit-testing — without jumping to another floor (that's what
+// "Move to …" / the layers panel is for). Named-floor assignment still goes
+// through `applyLayer` below.
 // ---------------------------------------------------------------------------
 
-/** Highest (`pick=max`) or lowest (`pick=min`) layer among shapes NOT in `ids`. */
-function boundaryLayer(ids: Set<ID>, pick: "max" | "min"): number {
+/** Highest (`pick=max`) or lowest (`pick=min`) lift among same-floor peers NOT in `ids`. */
+function boundaryLift(ids: Set<ID>, floor: number, pick: "max" | "min"): number {
   let best = pick === "max" ? -Infinity : Infinity;
   for (const [id, s] of Object.entries(doc.board.shapes)) {
     if (ids.has(id)) continue;
-    const L = s.layer ?? 0;
+    if ((s.layer ?? 0) !== floor) continue;
+    const L = s.lift ?? 0;
     best = pick === "max" ? Math.max(best, L) : Math.min(best, L);
   }
   return Number.isFinite(best) ? best : 0;
 }
 
-/** Set each selected shape's layer via `next`, redraw it, and persist if changed. */
+/** Set each selected shape's within-floor lift via `next`, redraw, and persist. */
+function applyLift(ids: Iterable<ID>, next: (cur: number, floor: number) => number): void {
+  let changed = false;
+  for (const id of new Set(ids)) {
+    const s = doc.board.shapes[id];
+    if (!s) continue;
+    const cur = s.lift ?? 0;
+    const nl = next(cur, s.layer ?? 0);
+    if (nl === cur) continue;
+    if (nl === 0) delete s.lift;
+    else s.lift = nl;
+    scene.updateNode(id); // re-elevate the pedestal + refresh connected edges
+    changed = true;
+  }
+  if (changed) bumpRevision();
+}
+
+/** Nudge the selection just above every peer on the same floor. */
+export function bringToFront(ids: Iterable<ID>): void {
+  const set = new Set(ids);
+  applyLift(set, (_cur, floor) => boundaryLift(set, floor, "max") + STACK_STEP);
+}
+
+/** Nudge the selection just below every peer on the same floor. */
+export function sendToBack(ids: Iterable<ID>): void {
+  const set = new Set(ids);
+  applyLift(set, (_cur, floor) => boundaryLift(set, floor, "min") - STACK_STEP);
+}
+
+/** Raise the selection one small stack step toward the viewer. */
+export function bringForward(ids: Iterable<ID>): void {
+  applyLift(ids, (cur) => cur + STACK_STEP);
+}
+
+/** Lower the selection one small stack step away from the viewer. */
+export function sendBackward(ids: Iterable<ID>): void {
+  applyLift(ids, (cur) => cur - STACK_STEP);
+}
+
+/** Set each selected shape's named floor via `next`, redraw it, and persist if changed. */
 function applyLayer(ids: Iterable<ID>, next: (cur: number) => number): void {
   let changed = false;
   for (const id of new Set(ids)) {
@@ -326,30 +383,6 @@ function applyLayer(ids: Iterable<ID>, next: (cur: number) => number): void {
     changed = true;
   }
   if (changed) bumpRevision();
-}
-
-/** Lift the selection above every other shape (drawn on top / nearest the viewer). */
-export function bringToFront(ids: Iterable<ID>): void {
-  const set = new Set(ids);
-  const target = boundaryLayer(set, "max") + 1;
-  applyLayer(set, () => target);
-}
-
-/** Sink the selection below every other shape (drawn behind everything). */
-export function sendToBack(ids: Iterable<ID>): void {
-  const set = new Set(ids);
-  const target = boundaryLayer(set, "min") - 1;
-  applyLayer(set, () => target);
-}
-
-/** Raise the selection one layer toward the viewer. */
-export function bringForward(ids: Iterable<ID>): void {
-  applyLayer(ids, (cur) => cur + 1);
-}
-
-/** Lower the selection one layer away from the viewer. */
-export function sendBackward(ids: Iterable<ID>): void {
-  applyLayer(ids, (cur) => cur - 1);
 }
 
 // ---------------------------------------------------------------------------

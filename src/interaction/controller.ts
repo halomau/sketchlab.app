@@ -19,7 +19,7 @@ import { scene } from "../render/scene";
 import { elevationOf, floorElevation, floorOf, H_ARROW, H_PED } from "../render/shading";
 import { defaultLabelFont } from "../render/shapeView";
 import * as actions from "../state/actions";
-import { DEFAULT_SIZE } from "../state/actions";
+import { averageCircleSize, DEFAULT_SIZE } from "../state/actions";
 import { copySelection, cutSelection, pasteClipboard } from "../state/clipboard";
 import { redo, undo } from "../state/history";
 import { DEFAULT_TEXT_FONT_SIZE } from "../state/style";
@@ -597,12 +597,13 @@ export class Controller {
     const dragPx = Math.hypot(g.cx - g.sx, g.cy - g.sy);
     let shape: Shape;
     if (dragPx < 4) {
+      const size = g.tool === "circle" ? averageCircleSize() : DEFAULT_SIZE;
       shape = actions.createShape(
         g.tool,
-        start.x - DEFAULT_SIZE / 2,
-        start.y - DEFAULT_SIZE / 2,
-        DEFAULT_SIZE,
-        DEFAULT_SIZE,
+        start.x - size / 2,
+        start.y - size / 2,
+        size,
+        size,
         { layer: g.layer },
       );
     } else {
@@ -1151,12 +1152,13 @@ export class Controller {
     const { w, h } = scene.screenSize();
     const cam = $camera.get();
     const c = screenToWorld(w / 2, h / 2) ?? { x: cam.focusX, y: cam.focusY };
+    const size = averageCircleSize();
     const shape = actions.createShape(
       "icon",
-      c.x - DEFAULT_SIZE / 2,
-      c.y - DEFAULT_SIZE / 2,
-      DEFAULT_SIZE,
-      DEFAULT_SIZE,
+      c.x - size / 2,
+      c.y - size / 2,
+      size,
+      size,
       { icon: key },
     );
     setSelection([shape.id], []);

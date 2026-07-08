@@ -698,11 +698,10 @@ class Scene {
   }
 
   /**
-   * Painter's order for the perspective scene. Primary key is the stacking
-   * `layer` (Send to Back / Bring to Front move a token up/down through layers),
-   * so layering is reliable and independent of where a token sits on the board.
-   * Within a layer, farther items paint first (true depth); edges sit behind
-   * nodes on an exact tie.
+   * Painter's order for the perspective scene. Primary key is the named floor
+   * (`layer`). Within a floor, true eye-space depth wins (farther first) — and
+   * Bring/Send Front/Back nudge a shape's within-floor `lift`, which feeds into
+   * that depth via elevation. Edges sit behind nodes on an exact tie.
    */
   private depthSort(): number {
     const proj = getActiveProjector();
@@ -1060,11 +1059,12 @@ class Scene {
   }
 
   // ---- hit testing (SCREEN space, elevation-aware) ----
-  // Tokens are drawn lifted off the board by their floor's elevation, so a ground
-  // footprint no longer sits under the visible token. We instead test the screen
-  // point against each token's projected TOP face (at its floor elevation), and
-  // edges against their projected path. The frontmost candidate wins — same key
-  // the painter uses: higher layer first, then nearer depth, then node-over-edge.
+  // Tokens are drawn lifted off the board by their floor elevation (+ optional
+  // within-floor stack nudge), so a ground footprint no longer sits under the
+  // visible token. We instead test the screen point against each token's
+  // projected TOP face, and edges against their projected path. The frontmost
+  // candidate wins — same key the painter uses: higher floor first, then nearer
+  // depth (lift feeds into depth), then node-over-edge.
   private isMoreFront(
     a: { layer: number; depth: number; isEdge: boolean },
     b: { layer: number; depth: number; isEdge: boolean },

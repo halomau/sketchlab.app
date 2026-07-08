@@ -194,7 +194,7 @@ export function generatedGraphToBoard(graph: GeneratedGraph, fallbackName: strin
       h: isText ? TEXT_H : NODE_H,
       fill: isText ? "transparent" : normalizeColor(node.color),
       text: node.label,
-      fontSize: isText ? DEFAULT_TEXT_FONT_SIZE : 16,
+      fontSize: DEFAULT_TEXT_FONT_SIZE,
     };
     if (kind === "icon") shape.icon = normalizeIcon(node.icon, node.label);
     const layer = node.layer ?? 0;
@@ -231,7 +231,7 @@ export function generatedGraphToBoard(graph: GeneratedGraph, fallbackName: strin
       from,
       to,
       label: edge.label ?? "",
-      fontSize: 16,
+      fontSize: DEFAULT_TEXT_FONT_SIZE,
       directed: edge.directed,
     };
     board.edges[id] = boardEdge;

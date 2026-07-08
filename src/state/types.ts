@@ -19,14 +19,19 @@ export interface Shape {
   /** label/text font size in world units; scales with the object on resize (defaults per kind) */
   fontSize?: number;
   /**
-   * Stacking layer for 3D depth ordering. Higher = nearer the viewer (rises off
-   * the board, drawn on top / "front"); lower = farther (sinks below, "back").
-   * Rendered as a world-up elevation (layer * FLOOR_STEP). Defaults to 0.
-   *
-   * Also the 0-based index into `Board.layers` — i.e. the named FLOOR this shape
-   * sits on. Each distinct value draws as its own glowing board plane.
+   * Named floor this shape sits on (0-based index into `Board.layers`). Each
+   * distinct value draws as its own glowing board plane. Elevation base is
+   * `layer * FLOOR_STEP`. Defaults to 0 (ground). Use "Move to …" / the layers
+   * panel to change floors — Bring/Send Front/Back nudge `lift` instead.
    */
   layer?: number;
+  /**
+   * Small within-floor height nudge (world-up units) for paint/hit order among
+   * overlapping tokens on the same floor. Bring Forward / Send Backward step
+   * this by a few units so a covered shape becomes clickable without jumping
+   * to another named floor. Defaults to 0.
+   */
+  lift?: number;
 }
 
 /** A named, rendered floor in the 3D stack. Index in Board.layers === Shape.layer. */

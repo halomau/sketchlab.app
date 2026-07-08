@@ -1,7 +1,10 @@
+import { DEFAULT_TEXT_FONT_SIZE } from "../state/style";
+
 export const LABEL_FONT = "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
 
-export const ICON_LABEL_FONT_SIZE = 14;
-export const NAMEPLATE_FONT_SIZE = 16;
+/** Match edge-label / style-panel M preset so node nameplates read the same size. */
+export const ICON_LABEL_FONT_SIZE = DEFAULT_TEXT_FONT_SIZE;
+export const NAMEPLATE_FONT_SIZE = DEFAULT_TEXT_FONT_SIZE;
 export const NAMEPLATE_FONT_WEIGHT = "700";
 export const NAMEPLATE_PAD_X = 11;
 export const NAMEPLATE_PAD_Y = 5;

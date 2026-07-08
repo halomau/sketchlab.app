@@ -32,6 +32,13 @@ export const H_PED = 38;
 export const H_ARROW = 9;
 
 /**
+ * World-up nudge applied by Bring Forward / Send Backward (and to-front / to-back).
+ * Small on purpose — just enough so overlapping tokens on the same floor separate
+ * for paint order and hit-testing, without jumping to another named floor.
+ */
+export const STACK_STEP = 5;
+
+/**
  * Default world-up units between adjacent floors. Each distinct `layer` value is
  * a discrete board FLOOR drawn at its own elevation. At 220 the floors read as
  * clearly separated plates. Floor lift is unbounded — a tall stack just recedes
@@ -107,9 +114,18 @@ export function floorElevation(i: number): number {
   return i * floorStep;
 }
 
-/** World-up elevation of a shape's pedestal base — its floor's plane (unbounded). */
-export function elevationOf(s: { layer?: number }): number {
-  return floorOf(s) * floorStep;
+/** Within-floor stack nudge of a shape (0 when unset). */
+export function liftOf(s: { lift?: number }): number {
+  return s.lift ?? 0;
+}
+
+/**
+ * World-up elevation of a shape's pedestal base — its floor's plane plus any
+ * within-floor stack nudge (Bring/Send Front/Back). Unbounded floor index; the
+ * nudge itself is kept small so tokens stay visually on their named floor.
+ */
+export function elevationOf(s: { layer?: number; lift?: number }): number {
+  return floorOf(s) * floorStep + liftOf(s);
 }
 
 /** Default opacity kept per floor of separation from the active layer (geometric falloff). */
