@@ -439,14 +439,41 @@ export function setLayerColor(index: number, color: string): void {
   bumpRevision(); // refresh the layers panel row swatches
 }
 
-/** Remove a floor: shapes on it drop to the floor below, higher shapes re-index down. */
-export function deleteLayer(index: number): void {
+/**
+ * Remove a floor. `mode` controls what happens to the shapes sitting on it:
+ * - "drop" (default): they fall to the floor below; higher shapes re-index down.
+ * - "purge": they are deleted along with the floor (with their connected edges),
+ *   as are any free-floating edges that lived on it.
+ */
+export function deleteLayer(index: number, mode: "drop" | "purge" = "drop"): void {
   const layers = doc.board.layers;
   if (!layers || index < 0 || index >= layers.length) return;
+
+  if (mode === "purge") {
+    // deleteShape also removes each shape's connected edges (Object.values is a
+    // snapshot, so deleting during iteration is safe)
+    for (const s of Object.values(doc.board.shapes)) {
+      if ((s.layer ?? 0) === index) deleteShape(s.id);
+    }
+    // drop free-floating edges (no anchored end) that float on this floor
+    const freeOnFloor = Object.values(doc.board.edges).filter(
+      (e) => e.from === undefined && e.to === undefined && (e.layer ?? 0) === index,
+    );
+    if (freeOnFloor.length) {
+      const removed = new Set<ID>();
+      for (const e of freeOnFloor) {
+        delete doc.board.edges[e.id];
+        scene.removeEdge(e.id);
+        removed.add(e.id);
+      }
+      doc.board.order = doc.board.order.filter((x) => !removed.has(x));
+    }
+  }
+
   layers.splice(index, 1);
   for (const s of Object.values(doc.board.shapes)) {
     const l = s.layer ?? 0;
-    if (l === index) s.layer = Math.max(0, index - 1);
+    if (l === index) s.layer = Math.max(0, index - 1); // only survivors in "drop" mode
     else if (l > index) s.layer = l - 1;
     scene.updateNode(s.id);
   }

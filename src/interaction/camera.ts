@@ -6,15 +6,20 @@ import {
   setFloorStep,
   setLayerFadeStep,
 } from "../render/shading";
+import { getMaxZoom, getMinZoom } from "./inputPrefs";
 import { $camera, $floorSpacing, $layerFade, doc } from "../state/store";
 import type { Camera } from "../state/types";
 import { clamp } from "../util";
 import { screenToWorld } from "./viewport";
 
-const MIN_ZOOM = 0.01;
-const MAX_ZOOM = 6;
-const MIN_DISTANCE = 500;
-const BASE_MAX_DISTANCE = 120000; // dolly ceiling for a single-floor board (reaches MIN_ZOOM)
+// Zoom limits are user-adjustable (Settings tray) and read live from inputPrefs.
+const minZoom = (): number => getMinZoom();
+const maxZoom = (): number => getMaxZoom();
+// The dolly-based zoom is capped on the near side by the min dolly distance. To
+// let the zoom-in limit actually be reached we shrink that floor as the max-zoom
+// rises (distance = DEFAULT_DISTANCE / zoom at the fit focal), never absurdly close.
+const minDistance = (): number => Math.max(60, DEFAULT_DISTANCE / maxZoom());
+const BASE_MAX_DISTANCE = 120000; // dolly ceiling for a single-floor board (reaches min zoom)
 const MAX_DISTANCE_PER_FLOOR = 1200; // extra pull-back room each stacked floor adds…
 const MAX_DISTANCE_CAP = 120000; // …up to here, where DEFAULT_DISTANCE / cap === MIN_ZOOM
 const MIN_PITCH = 0.05;
@@ -43,14 +48,14 @@ function maxDistance(): number {
 }
 
 function clampDollyDistance(next: Camera): number {
-  return clamp(next.distance, MIN_DISTANCE, maxDistance());
+  return clamp(next.distance, minDistance(), maxDistance());
 }
 
 function keepDefaultPerspective(next: Camera): Camera {
-  const requestedZoom = clamp(next.zoom, MIN_ZOOM, MAX_ZOOM);
+  const requestedZoom = clamp(next.zoom, minZoom(), maxZoom());
   const requestedDistance = DEFAULT_DISTANCE / requestedZoom;
   const distance = clampDollyDistance({ ...next, zoom: requestedZoom, distance: requestedDistance });
-  return { ...next, zoom: clamp(DEFAULT_DISTANCE / distance, MIN_ZOOM, MAX_ZOOM), distance };
+  return { ...next, zoom: clamp(DEFAULT_DISTANCE / distance, minZoom(), maxZoom()), distance };
 }
 
 /**
@@ -87,7 +92,7 @@ export function isFocusOffBoard(): boolean {
 export function setCamera(next: Camera): void {
   const pitch = clamp(next.pitch, MIN_PITCH, MAX_PITCH);
   const distance = clampDollyDistance({ ...next, pitch });
-  const zoom = clamp(next.zoom, MIN_ZOOM, MAX_ZOOM);
+  const zoom = clamp(next.zoom, minZoom(), maxZoom());
   const { focusX, focusY } = clampFocus({ ...next, pitch, distance, zoom });
   $camera.set({
     focusX,
@@ -129,10 +134,10 @@ export function panByScreen(dx: number, dy: number): void {
 export function zoomBy(factor: number): void {
   const c = $camera.get();
   const focal = c.distance * c.zoom;
-  const requestedZoom = clamp(c.zoom * factor, MIN_ZOOM, MAX_ZOOM);
+  const requestedZoom = clamp(c.zoom * factor, minZoom(), maxZoom());
   const requestedDistance = focal / requestedZoom;
   const distance = clampDollyDistance({ ...c, zoom: requestedZoom, distance: requestedDistance });
-  const zoom = clamp(focal / distance, MIN_ZOOM, MAX_ZOOM);
+  const zoom = clamp(focal / distance, minZoom(), maxZoom());
   if (zoom === c.zoom && distance === c.distance) return;
   setCamera({ ...c, zoom, distance });
 }
@@ -248,6 +253,15 @@ export function getZoom(): number {
   return $camera.get().zoom;
 }
 
+/**
+ * Re-apply the (possibly just-changed) zoom limits to the live camera. Called
+ * when the Settings sliders move so a now-out-of-range zoom snaps back into the
+ * new min/max without waiting for the next wheel notch.
+ */
+export function reclampZoom(): void {
+  setCamera($camera.get());
+}
+
 function contentBounds(): { x: number; y: number; w: number; h: number } | null {
   const shapes = Object.values(doc.board.shapes);
   if (shapes.length === 0) return null;
@@ -286,7 +300,7 @@ export function fitToContent(): void {
   const pad = 0.5;
   // include the floor stack's vertical rise so the top floor stays in frame
   const effH = b.h + floorElevation(floorCount() - 1) * 0.7;
-  const zoom = clamp(Math.min(w / b.w, h / effH) * pad, MIN_ZOOM, MAX_ZOOM);
+  const zoom = clamp(Math.min(w / b.w, h / effH) * pad, minZoom(), maxZoom());
   setCamera(keepDefaultPerspective({
     focusX: b.x + b.w / 2,
     // bias the focus toward the far edge so content seats in the lower-center,

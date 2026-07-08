@@ -38,7 +38,7 @@ import { measureTextBox, TEXT_FONT_SIZE, TEXT_PAD } from "../render/measure";
 import { panBy, panByScreen, rotateBy, spaceLayersBy, tiltBy, zoomAt } from "./camera";
 import { ContextMenu } from "./contextMenu";
 import { IconPalette } from "./iconPalette";
-import { getWheelZoom } from "./inputPrefs";
+import { getInvertPitch, getRightDragPan, getWheelZoom, getZoomFactor } from "./inputPrefs";
 import { TextEditor } from "./textEditor";
 import { screenToWorld, screenToWorldAt, worldToScreen } from "./viewport";
 
@@ -149,6 +149,10 @@ export class Controller {
   private subs: Array<() => void> = [];
   /** Last canvas-local pointer position, so a keyboard paste can target the cursor. */
   private lastPointer: Pt | null = null;
+  /** Down point of an in-progress right-button pan, or null. Drives context-menu suppression. */
+  private rightPanStart: Pt | null = null;
+  /** Set when a right-button pan actually dragged, so the ensuing contextmenu is swallowed. */
+  private suppressContextMenu = false;
 
   constructor(private root: HTMLElement) {
     this.textEditor = new TextEditor(root);
@@ -284,6 +288,12 @@ export class Controller {
    */
   private onContextMenu = (e: MouseEvent): void => {
     e.preventDefault();
+    // a right-button pan drag just ended — swallow this menu instead of opening it
+    if (this.suppressContextMenu) {
+      this.suppressContextMenu = false;
+      this.menu.close();
+      return;
+    }
     const p = this.local(e);
     // pick the frontmost shape under the cursor on ANY floor — the active floor
     // is just a visual highlight, not a selection filter
@@ -317,13 +327,26 @@ export class Controller {
 
   // ---- pointer ----
   private onPointerDown = (e: PointerEvent): void => {
-    if (e.button !== 0 && e.button !== 1) return;
+    // Right button (2) is normally reserved for the context menu; it only starts
+    // a gesture here when the "Right-click drag to pan" setting is on.
+    const rightPan = e.button === 2 && getRightDragPan();
+    if (e.button !== 0 && e.button !== 1 && !rightPan) return;
     this.textEditor.commit();
     this.root.setPointerCapture(e.pointerId);
     const p = this.local(e);
     this.lastPointer = p;
     const world = screenToWorld(p.x, p.y);
     const tool = $tool.get();
+
+    // Right-button pan: hold RMB and drag to grab the canvas and pan (hand cursor).
+    // A plain right-click that doesn't drag falls through to the context menu.
+    if (rightPan) {
+      this.gesture = { kind: "pan", lastX: p.x, lastY: p.y };
+      this.rightPanStart = p;
+      this.suppressContextMenu = false;
+      this.root.style.cursor = "grabbing";
+      return;
+    }
 
     // Alt/Option + left-drag orbits the camera (horizontal = yaw, vertical =
     // tilt). A camera gesture: it ignores the active tool and needs no ground
@@ -482,18 +505,29 @@ export class Controller {
     switch (g.kind) {
       case "pan":
         panBy(g.lastX, g.lastY, p.x, p.y);
+        // once a right-button pan moves past the click threshold, swallow the
+        // contextmenu that fires on release so the drag doesn't also pop the menu
+        if (
+          this.rightPanStart &&
+          Math.hypot(p.x - this.rightPanStart.x, p.y - this.rightPanStart.y) > MOVE_THRESHOLD
+        ) {
+          this.suppressContextMenu = true;
+        }
         g.lastX = p.x;
         g.lastY = p.y;
         break;
-      case "orbit":
+      case "orbit": {
         // horizontal drag spins the turntable, vertical drag tilts the pitch.
-        // Drag down (dy > 0) lowers pitch toward the horizon — matching the
-        // Alt+scroll tilt direction; setCamera clamps the pitch range.
+        // Natively, drag down (dy > 0) lowers pitch toward the horizon; the
+        // Settings → "Reverse vertical pitch" toggle flips that up/down direction
+        // for users coming from other 3D tools. setCamera clamps the pitch range.
+        const pitchSign = getInvertPitch() ? 1 : -1;
         rotateBy((p.x - g.lastX) * ORBIT_YAW_SPEED);
-        tiltBy(-(p.y - g.lastY) * ORBIT_TILT_SPEED);
+        tiltBy(pitchSign * (p.y - g.lastY) * ORBIT_TILT_SPEED);
         g.lastX = p.x;
         g.lastY = p.y;
         break;
+      }
       case "drawEdge":
         g.px = p.x;
         g.py = p.y;
@@ -566,6 +600,7 @@ export class Controller {
   private onPointerUp = (e: PointerEvent): void => {
     const g = this.gesture;
     this.gesture = { kind: "none" };
+    this.rightPanStart = null;
     try {
       this.root.releasePointerCapture(e.pointerId);
     } catch {
@@ -809,8 +844,9 @@ export class Controller {
       // Mirror zoom's curve: pinch-out (deltaY < 0) fans the stack wider.
       spaceLayersBy(Math.exp(-e.deltaY * 0.01));
     } else if (e.ctrlKey || e.metaKey) {
-      // ⌘/Ctrl + scroll or trackpad pinch → zoom toward the cursor.
-      zoomAt(Math.exp(-e.deltaY * 0.01), p.x, p.y);
+      // ⌘/Ctrl + scroll or trackpad pinch → zoom toward the cursor. The per-notch
+      // strength follows the Settings "Zoom sensitivity" slider.
+      zoomAt(Math.exp(-e.deltaY * getZoomFactor()), p.x, p.y);
     } else if (e.altKey) {
       // Alt/Option+scroll: route by the dominant swipe axis so a trackpad gesture
       // (which carries both deltas) does one thing cleanly. Horizontal → spin the
@@ -824,8 +860,9 @@ export class Controller {
       }
     } else if (getWheelZoom()) {
       // opt-in (Controls → "Scroll wheel zooms"): a plain wheel notch zooms toward
-      // the cursor instead of panning — the behavior a mouse user expects.
-      zoomAt(Math.exp(-e.deltaY * 0.01), p.x, p.y);
+      // the cursor instead of panning — the behavior a mouse user expects. Strength
+      // follows the Settings "Zoom sensitivity" slider.
+      zoomAt(Math.exp(-e.deltaY * getZoomFactor()), p.x, p.y);
     } else {
       panByScreen(-e.deltaX, -e.deltaY);
     }

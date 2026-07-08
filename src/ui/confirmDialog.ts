@@ -108,3 +108,98 @@ export function confirmDialog(opts: ConfirmOptions): Promise<boolean> {
     confirmBtn.focus();
   });
 }
+
+export interface ChoiceOption {
+  /** Value resolved when this button is chosen. */
+  id: string;
+  /** Button label. */
+  label: string;
+  /** Visual style. Defaults to "primary". */
+  variant?: "primary" | "danger" | "ghost";
+}
+
+export interface ChoiceOptions {
+  title: string;
+  message: string;
+  /** Buttons rendered left → right. */
+  options: ChoiceOption[];
+  /** Option id resolved on Escape / backdrop click. Defaults to "". */
+  dismissId?: string;
+}
+
+/**
+ * A modal like {@link confirmDialog} but with an arbitrary set of choices,
+ * resolving the chosen option's `id` (or `dismissId` on Escape/backdrop). Used
+ * where a destructive action has more than one outcome — e.g. deleting a floor
+ * can either drop its shapes to the floor below or delete them along with it.
+ */
+export function choiceDialog(opts: ChoiceOptions): Promise<string> {
+  const { title, message, options, dismissId = "" } = opts;
+
+  return new Promise<string>((resolve) => {
+    let settled = false;
+
+    const finish = (result: string): void => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener("keydown", onKey, true);
+      backdrop.remove();
+      resolve(result);
+    };
+
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(dismissId);
+      }
+    };
+
+    const variantClass = (v: ChoiceOption["variant"]): string =>
+      v === "danger"
+        ? "confirm-dialog__btn--danger"
+        : v === "ghost"
+          ? "confirm-dialog__btn--ghost"
+          : "confirm-dialog__btn--primary";
+
+    const buttons = options.map((opt) =>
+      h(
+        "button",
+        {
+          class: `confirm-dialog__btn ${variantClass(opt.variant)}`,
+          type: "button",
+          onclick: () => finish(opt.id),
+        },
+        opt.label,
+      ),
+    );
+
+    const card = h(
+      "div",
+      {
+        class: "confirm-dialog__card",
+        role: "alertdialog",
+        "aria-modal": "true",
+        "aria-label": title,
+      },
+      h("h2", { class: "confirm-dialog__title" }, title),
+      h("p", { class: "confirm-dialog__message" }, message),
+      h("div", { class: "confirm-dialog__actions" }, ...buttons),
+    );
+
+    const backdrop = h(
+      "div",
+      {
+        class: "confirm-dialog is-open",
+        onclick: (e: Event) => {
+          if (e.target === backdrop) finish(dismissId);
+        },
+      },
+      card,
+    ) as HTMLDivElement;
+
+    document.body.appendChild(backdrop);
+    window.addEventListener("keydown", onKey, true);
+    (buttons[0] as HTMLButtonElement | undefined)?.focus();
+  });
+}
