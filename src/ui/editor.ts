@@ -33,6 +33,9 @@ function svg(inner: string): string {
 
 const ICON_SELECT = svg('<path d="M5 3l13.5 7-5.8 1.5L9.5 20z" fill="currentColor" stroke="none"/>');
 const ICON_TEXT = svg('<path d="M6 6h12"/><path d="M12 6v12"/>');
+const ICON_CODE = svg(
+  '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M8 10l-2 2 2 2"/><path d="M16 10l2 2-2 2"/><path d="M12 9.5l-1.5 5"/>',
+);
 const ICON_RECT = svg('<rect x="4" y="6.5" width="16" height="11" rx="2"/>');
 const ICON_CIRCLE = svg('<circle cx="12" cy="12" r="7.5"/>');
 const ICON_LINE = svg('<path d="M6.5 17.5 17.5 6.5"/><circle cx="6" cy="18" r="2"/><circle cx="18" cy="6" r="2"/>');
@@ -73,6 +76,7 @@ const ICON_RECENTER = svg(
 const TOOLS: Array<{ tool: ToolName; icon: string; key: string; title: string }> = [
   { tool: "select", icon: ICON_SELECT, key: "V", title: "Select / move (V)" },
   { tool: "text", icon: ICON_TEXT, key: "T", title: "Text (T) — or double-click the canvas" },
+  { tool: "code", icon: ICON_CODE, key: "C", title: "Code panel (C)" },
   { tool: "rect", icon: ICON_RECT, key: "R", title: "Rectangle (R)" },
   { tool: "circle", icon: ICON_CIRCLE, key: "O", title: "Circle (O)" },
   { tool: "line", icon: ICON_LINE, key: "L", title: "Connector line (L)" },
@@ -431,8 +435,8 @@ export async function mountEditor(
     },
   });
 
-  // text-size presets: apply a global font size to every existing label/text and
-  // remember it as the default for new text and edge labels.
+  // text-size presets: apply a global font size to every existing label/text/code
+  // panel and remember it as the default for new text, code, and edge labels.
   const sizeButtons = TEXT_SIZE_PRESETS.map((preset) =>
     h(
       "button",

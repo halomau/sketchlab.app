@@ -17,7 +17,7 @@ import { getActiveProjector, projectBoard, scaleAtBoard } from "../render/projec
 import { isShapeInViewport } from "../render/culling";
 import { scene } from "../render/scene";
 import { elevationOf, floorElevation, floorOf, H_ARROW, H_PED } from "../render/shading";
-import { defaultLabelFont } from "../render/shapeView";
+import { DEFAULT_CODE_H, DEFAULT_CODE_W, defaultLabelFont } from "../render/shapeView";
 import * as actions from "../state/actions";
 import { averageCircleSize, DEFAULT_SIZE } from "../state/actions";
 import { copySelection, cutSelection, pasteClipboard } from "../state/clipboard";
@@ -79,7 +79,7 @@ type Gesture =
   | { kind: "orbit"; lastX: number; lastY: number }
   | {
       kind: "create";
-      tool: "rect" | "circle";
+      tool: "rect" | "circle" | "code";
       sx: number;
       sy: number;
       cx: number;
@@ -221,7 +221,13 @@ export class Controller {
     if (this.altDown) c = "move";
     else if (this.spaceDown || tool === "hand") c = "grab";
     else if (tool === "text") c = "text";
-    else if (tool === "rect" || tool === "circle" || tool === "line" || tool === "arrow")
+    else if (
+      tool === "rect" ||
+      tool === "circle" ||
+      tool === "code" ||
+      tool === "line" ||
+      tool === "arrow"
+    )
       c = "crosshair";
     this.root.style.cursor = c;
   }
@@ -229,7 +235,7 @@ export class Controller {
   /**
    * Elevation the selection outline + resize handles ride at — the SAME plane the
    * outline box/ring is drawn at in drawOverlay, so handles glue to the visible
-   * shape: the lifted slab top (base + H_PED) for rect/image/circle/icon, the
+   * shape: the lifted slab top (base + H_PED) for rect/image/circle/icon/code, the
    * ground plane (base) for text. Keep this in sync with drawOverlay.
    */
   private outlineElevation(s: Shape): number {
@@ -370,7 +376,7 @@ export class Controller {
       return;
     }
 
-    if (tool === "rect" || tool === "circle") {
+    if (tool === "rect" || tool === "circle" || tool === "code") {
       const layer = $activeLayer.get();
       this.gesture = {
         kind: "create",
@@ -632,25 +638,37 @@ export class Controller {
     const dragPx = Math.hypot(g.cx - g.sx, g.cy - g.sy);
     let shape: Shape;
     if (dragPx < 4) {
-      const size = g.tool === "circle" ? averageCircleSize() : DEFAULT_SIZE;
-      shape = actions.createShape(
-        g.tool,
-        start.x - size / 2,
-        start.y - size / 2,
-        size,
-        size,
-        { layer: g.layer },
-      );
+      if (g.tool === "code") {
+        shape = actions.createShape(
+          "code",
+          start.x - DEFAULT_CODE_W / 2,
+          start.y - DEFAULT_CODE_H / 2,
+          DEFAULT_CODE_W,
+          DEFAULT_CODE_H,
+          { layer: g.layer, fill: "#0d1117" },
+        );
+      } else {
+        const size = g.tool === "circle" ? averageCircleSize() : DEFAULT_SIZE;
+        shape = actions.createShape(
+          g.tool,
+          start.x - size / 2,
+          start.y - size / 2,
+          size,
+          size,
+          { layer: g.layer },
+        );
+      }
     } else {
       // Resolve the drag on the raised top plane so the visible token lands under the cursor.
       const square = g.square || g.tool === "circle";
       const b = dragBox(start.x, start.y, cur.x, cur.y, square);
-      shape = actions.createShape(g.tool, b.x, b.y, Math.max(8, b.w), Math.max(8, b.h), {
-        layer: g.layer,
-      });
+      const extra =
+        g.tool === "code" ? { layer: g.layer, fill: "#0d1117" } : { layer: g.layer };
+      shape = actions.createShape(g.tool, b.x, b.y, Math.max(8, b.w), Math.max(8, b.h), extra);
     }
     setSelection([shape.id], []);
     $tool.set("select");
+    if (shape.kind === "code") this.beginShapeText(shape.id, "", true);
   }
 
   /**
@@ -781,8 +799,9 @@ export class Controller {
     }
 
     const patch: Partial<Shape> = { x: nx, y: ny, w: nw, h: nh };
-    // scale the label with the object's height (an edge-only width drag keeps it)
-    if (s.text && s.h > 0) {
+    // scale the label with the object's height (an edge-only width drag keeps it).
+    // Code panels keep a fixed font — resize only changes the terminal viewport.
+    if (s.kind !== "code" && s.text && s.h > 0) {
       const base = s.fontSize ?? defaultLabelFont(s.kind);
       patch.fontSize = Math.min(MAX_FONT, Math.max(MIN_FONT, base * (nh / s.h)));
     }
@@ -1003,6 +1022,7 @@ export class Controller {
       const k = e.key.toLowerCase();
       if (k === "v") return void $tool.set("select");
       if (k === "t") return void $tool.set("text");
+      if (k === "c") return void $tool.set("code");
       if (k === "r") return void $tool.set("rect");
       if (k === "o") return void $tool.set("circle");
       if (k === "l") return void $tool.set("line");
@@ -1137,7 +1157,65 @@ export class Controller {
       return;
     }
 
+    if (s.kind === "code") {
+      this.beginCodeText(id, s, value, seed, isNewText);
+      return;
+    }
+
     this.beginNameplateText(id, s, value, seed);
+    if (seed) actions.setShapeText(id, value);
+  }
+
+  private beginCodeText(
+    id: ID,
+    s: Shape,
+    value: string,
+    seed: string,
+    isNew = false,
+  ): void {
+    const proj = getActiveProjector();
+    const top = elevationOf(s) + H_PED;
+    const inset = Math.min(s.w, s.h) * 0.04;
+    const tl = projectBoard(proj, s.x + inset, s.y + inset, top);
+    if (!tl.ok) return;
+    const zoom = Math.max(0.1, scaleAtBoard(proj, s.x + s.w / 2, s.y + s.h / 2, top));
+    const fontSize = (s.fontSize ?? defaultLabelFont("code")) * zoom;
+    const titleH = 22 * zoom;
+    const padX = 10 * zoom;
+    const padY = 8 * zoom;
+    const panelW = Math.max(40, (s.w - inset * 2) * zoom);
+    const panelH = Math.max(40, (s.h - inset * 2) * zoom);
+
+    scene.setNodeLabelHidden(id, true);
+    const restore = () => scene.setNodeLabelHidden(id, false);
+    this.textEditor.open({
+      x: tl.sx,
+      y: tl.sy + titleH,
+      w: panelW,
+      h: Math.max(24, panelH - titleH),
+      value,
+      color: "#e6edf3",
+      background: "#0d1117",
+      fontSize,
+      fontWeight: "500",
+      lineHeight: fontSize * 1.45,
+      align: "left",
+      noWrap: true,
+      selectAll: !seed && !isNew,
+      padding: Math.max(4, Math.min(padX, padY)),
+      className: "text-editor--code",
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+      onInput: (v) => actions.setShapeText(id, v),
+      onCommit: (v) => {
+        restore();
+        actions.setShapeText(id, v);
+      },
+      onCancel: () => {
+        restore();
+        if (isNew && !this.editOriginal.trim()) actions.deleteShape(id);
+        else actions.setShapeText(id, this.editOriginal);
+      },
+    });
     if (seed) actions.setShapeText(id, value);
   }
 

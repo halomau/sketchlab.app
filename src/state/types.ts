@@ -1,6 +1,6 @@
 export type ID = string;
 
-export type ShapeKind = "rect" | "circle" | "icon" | "image" | "text";
+export type ShapeKind = "rect" | "circle" | "icon" | "image" | "text" | "code";
 
 export interface Shape {
   id: ID;
@@ -11,6 +11,7 @@ export interface Shape {
   w: number;
   h: number;
   fill: string;
+  /** label for most kinds; for kind === "code" this is the source snippet */
   text: string;
   /** only for kind === "icon": registry key of the icon to draw */
   icon?: string;
@@ -104,6 +105,7 @@ export interface BoardMeta {
 export type ToolName =
   | "select"
   | "text"
+  | "code"
   | "rect"
   | "circle"
   | "line"

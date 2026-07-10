@@ -8,6 +8,7 @@ import {
   Texture,
 } from "pixi.js";
 import type { Shape, ShapeKind } from "../state/types";
+import { CODE_THEME_DEFAULT, highlightCode } from "./codeHighlight";
 import { hexToNumber, NO_FILL, readableText } from "./geometry";
 import { drawIcon } from "./icons";
 import {
@@ -31,15 +32,29 @@ import {
 } from "./projection";
 import { elevationOf, FALLBACK, H_PED, shade, tint } from "./shading";
 
+const CODE_BODY = "#0d1117";
+const CODE_TITLE = "#161b22";
+const CODE_BORDER = "#30363d";
+const CODE_MUTED = "#8b949e";
+const CODE_MONO = "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+const CODE_TITLE_H = 22;
+const CODE_PAD_X = 10;
+const CODE_PAD_Y = 8;
+const CODE_RADIUS = 8;
+
 const NAMEPLATE_OFFSET_Y = 14;
 const NAMEPLATE_SCREEN_NUDGE_Y = 8;
 
 /** Default label font size (world units) for a shape kind, before any resize scaling. */
 export function defaultLabelFont(kind: ShapeKind): number {
-  if (kind === "text") return TEXT_FONT_SIZE;
+  if (kind === "text" || kind === "code") return TEXT_FONT_SIZE;
   if (kind === "icon" || kind === "image") return ICON_LABEL_FONT_SIZE;
   return NAMEPLATE_FONT_SIZE;
 }
+
+/** Default world size for a click-placed (no-drag) code panel. */
+export const DEFAULT_CODE_W = 320;
+export const DEFAULT_CODE_H = 200;
 
 export interface NodeView {
   container: Container;
@@ -274,9 +289,9 @@ function drawSlab(g: Graphics, s: Shape, proj: Projector): void {
   }
 }
 
-/** Faux-3D pedestal: a disc for circle/icon, a rectangular slab for rect/image. */
+/** Faux-3D pedestal: a disc for circle/icon, a rectangular slab for rect/image/code. */
 function drawPedestal(g: Graphics, s: Shape, proj: Projector): void {
-  if (s.kind === "rect" || s.kind === "image") drawSlab(g, s, proj);
+  if (s.kind === "rect" || s.kind === "image" || s.kind === "code") drawSlab(g, s, proj);
   else drawDisc(g, s, proj);
 }
 
@@ -310,6 +325,114 @@ function createTextTexture(s: Shape): Texture {
     for (let i = 0; i < lines.length; i++) {
       ctx.fillText(lines[i] || " ", TEXT_PAD, TEXT_PAD + i * lineHeight);
     }
+  }
+
+  return Texture.from(canvas, true);
+}
+
+function createCodeTexture(s: Shape): Texture {
+  const fontSize = s.fontSize ?? defaultLabelFont("code");
+  const lineHeight = fontSize * 1.45;
+  const resolution = 2;
+  const w = Math.max(1, s.w);
+  const h = Math.max(1, s.h);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.ceil(w * resolution));
+  canvas.height = Math.max(1, Math.ceil(h * resolution));
+
+  const ctx = canvas.getContext("2d");
+  if (ctx) {
+    ctx.scale(resolution, resolution);
+    roundedRectPath(ctx, 0.5, 0.5, w - 1, h - 1, CODE_RADIUS);
+    ctx.fillStyle = CODE_BODY;
+    ctx.fill();
+    ctx.lineWidth = 1.25;
+    ctx.strokeStyle = CODE_BORDER;
+    ctx.stroke();
+
+    // title bar
+    ctx.save();
+    roundedRectPath(ctx, 0.5, 0.5, w - 1, h - 1, CODE_RADIUS);
+    ctx.clip();
+    ctx.fillStyle = CODE_TITLE;
+    ctx.fillRect(0, 0, w, CODE_TITLE_H);
+    ctx.restore();
+
+    // traffic lights
+    const dots = [
+      { x: 12, c: "#ff5f56" },
+      { x: 28, c: "#ffbd2e" },
+      { x: 44, c: "#27c93f" },
+    ];
+    for (const d of dots) {
+      ctx.beginPath();
+      ctx.arc(d.x, CODE_TITLE_H / 2, 4, 0, Math.PI * 2);
+      ctx.fillStyle = d.c;
+      ctx.fill();
+    }
+
+    const { language, tokens } = highlightCode(s.text);
+    ctx.font = `500 10px ${LABEL_FONT}`;
+    ctx.fillStyle = CODE_MUTED;
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    const langLabel = language === "plaintext" ? "code" : language;
+    ctx.fillText(langLabel, w - 10, CODE_TITLE_H / 2);
+
+    // code body (clipped)
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, CODE_TITLE_H, w, Math.max(0, h - CODE_TITLE_H));
+    ctx.clip();
+
+    ctx.font = `500 ${fontSize}px ${CODE_MONO}`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+
+    let x = CODE_PAD_X;
+    let y = CODE_TITLE_H + CODE_PAD_Y;
+    const maxY = h - CODE_PAD_Y;
+
+    if (!tokens.length) {
+      ctx.fillStyle = CODE_MUTED;
+      ctx.fillText("// paste code…", x, y);
+    } else {
+      for (const tok of tokens) {
+        const parts = tok.text.split("\n");
+        for (let i = 0; i < parts.length; i++) {
+          if (i > 0) {
+            x = CODE_PAD_X;
+            y += lineHeight;
+            if (y > maxY) break;
+          }
+          const piece = parts[i];
+          if (!piece) continue;
+          if (y > maxY) break;
+          ctx.fillStyle = tok.color || CODE_THEME_DEFAULT;
+          // clip horizontally by measuring and skipping overflow chars cheaply
+          const avail = w - CODE_PAD_X - x;
+          if (avail <= 0) continue;
+          const fullW = ctx.measureText(piece).width;
+          if (fullW <= avail) {
+            ctx.fillText(piece, x, y);
+            x += fullW;
+          } else {
+            // binary-ish trim to fit remaining width
+            let lo = 0;
+            let hi = piece.length;
+            while (lo < hi) {
+              const mid = Math.ceil((lo + hi) / 2);
+              if (ctx.measureText(piece.slice(0, mid)).width <= avail) lo = mid;
+              else hi = mid - 1;
+            }
+            if (lo > 0) ctx.fillText(piece.slice(0, lo), x, y);
+            x = w; // mark line full
+          }
+        }
+        if (y > maxY) break;
+      }
+    }
+    ctx.restore();
   }
 
   return Texture.from(canvas, true);
@@ -516,6 +639,11 @@ export function reprojectNodeView(view: NodeView, s: Shape, proj: Projector): vo
     sp.scale.set(apex.scale * 0.92);
   }
 
+  if (s.kind === "code") {
+    placeCodeFace(view, s, proj);
+    return;
+  }
+
   placeNameplate(view, s, proj);
 }
 
@@ -525,12 +653,47 @@ export function reprojectNodeLabelView(view: NodeView, s: Shape, proj: Projector
     placePerspectiveText(view, s, proj);
     return;
   }
+  if (s.kind === "code") {
+    // code face lives on the node container, not the label layer
+    return;
+  }
   placeNameplate(view, s, proj);
 }
 
 function placePerspectiveText(view: NodeView, s: Shape, proj: Projector): void {
   if (!view.textMesh) return;
   const q = projectQuad(proj, s.x, s.y, s.x + s.w, s.y + s.h, elevationOf(s));
+  if (!q.length) {
+    view.textMesh.visible = false;
+    return;
+  }
+  view.textMesh.setFromMatrix(Matrix.IDENTITY);
+  view.textMesh.setCorners(
+    q[0].sx,
+    q[0].sy,
+    q[1].sx,
+    q[1].sy,
+    q[2].sx,
+    q[2].sy,
+    q[3].sx,
+    q[3].sy,
+  );
+  view.textMesh.visible = !view.labelHidden;
+}
+
+/** Project the terminal texture onto the raised slab top (same plane as the pedestal face). */
+function placeCodeFace(view: NodeView, s: Shape, proj: Projector): void {
+  if (!view.textMesh) return;
+  const top = elevationOf(s) + H_PED;
+  const inset = Math.min(s.w, s.h) * 0.04;
+  const q = projectQuad(
+    proj,
+    s.x + inset,
+    s.y + inset,
+    s.x + s.w - inset,
+    s.y + s.h - inset,
+    top,
+  );
   if (!q.length) {
     view.textMesh.visible = false;
     return;
@@ -621,6 +784,25 @@ function syncIcon(view: NodeView, s: Shape): void {
 }
 
 function syncText(view: NodeView, s: Shape): void {
+  if (s.kind === "code") {
+    const texture = createCodeTexture(s);
+    if (!view.textMesh) {
+      view.textMesh = new PerspectiveMesh({ texture, verticesX: 8, verticesY: 8 });
+      view.container.addChild(view.textMesh);
+    } else {
+      view.textMesh.texture = texture;
+      if (view.textMesh.parent !== view.container) {
+        view.textMesh.parent?.removeChild(view.textMesh);
+        view.container.addChild(view.textMesh);
+      }
+    }
+    view.textTexture?.destroy(true);
+    view.textTexture = texture;
+    view.textW = s.w;
+    view.textH = s.h;
+    view.textMesh.visible = !view.labelHidden;
+    return;
+  }
   if (!s.text) {
     clearTextMesh(view);
     return;

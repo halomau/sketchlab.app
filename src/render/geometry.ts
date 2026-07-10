@@ -21,7 +21,7 @@ export function boundaryPoint(s: Shape, target: Pt): Pt {
     const len = Math.hypot(dx, dy) || 1;
     return { x: c.x + (dx / len) * r, y: c.y + (dy / len) * r };
   }
-  // rect / image / text: intersect ray with the half-extent box
+  // rect / image / text / code: intersect ray with the half-extent box
   const hw = s.w / 2;
   const hh = s.h / 2;
   const tx = dx !== 0 ? hw / Math.abs(dx) : Infinity;

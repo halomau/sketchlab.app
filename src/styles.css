@@ -730,6 +730,21 @@ button {
   outline: none;
 }
 
+/* Terminal-style overlay for code panels — top-left aligned monospace body */
+.text-editor--code {
+  display: block;
+  align-items: stretch;
+  justify-content: flex-start;
+  text-align: left;
+  border-radius: 0 0 8px 8px;
+  border-color: #30363d;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+  caret-color: #58a6ff;
+  white-space: pre;
+  word-break: normal;
+  overflow: auto;
+}
+
 /* ---------- icon palette ---------- */
 .icon-palette {
   position: absolute;
