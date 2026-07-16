@@ -15,13 +15,13 @@ import { generatedGraphToBoard } from "../state/generatedGraph";
 import { createStarterBoard } from "../state/starterBoard";
 import { emptyBoard } from "../state/store";
 import { BoardDrawer } from "./boardDrawer";
-import { confirmDialog } from "./confirmDialog";
+import { confirmDialog, promptDialog } from "./confirmDialog";
 import { ControlsHelp } from "./controlsHelp";
 import { LayersPanel } from "./layersPanel";
 import { SettingsPanel } from "./settingsPanel";
 import { AIGeneratePanel } from "./aiGeneratePanel";
 import { SkillHelp } from "./skillHelp";
-import { clear, h, toast } from "./dom";
+import { clear, downloadFile, h, toast } from "./dom";
 import { navigate } from "./nav";
 import { createSwatchPicker } from "./swatchPicker";
 
@@ -71,6 +71,12 @@ const ICON_SKILL = svg(
 );
 const ICON_RECENTER = svg(
   '<circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v4M12 17.5v4M2.5 12h4M17.5 12h4"/>',
+);
+const ICON_SAVE = svg(
+  '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>',
+);
+const ICON_OPEN = svg(
+  '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>',
 );
 
 const TOOLS: Array<{ tool: ToolName; icon: string; key: string; title: string }> = [
@@ -303,6 +309,69 @@ export async function mountEditor(
     "Save a copy",
   );
 
+  const saveBtn = h(
+    "button",
+    {
+      class: "btn btn--icon",
+      title: "Save sketch file",
+      "aria-label": "Save sketch file",
+      html: ICON_SAVE,
+      onclick: async () => {
+        const defaultName = doc.board.name.replace(/[^a-zA-Z0-9_-]/g, "_") || "sketch";
+        const name = await promptDialog({
+          title: "Save sketch",
+          message: "Enter a name for the sketch file.",
+          defaultValue: defaultName,
+          placeholder: "sketch-name",
+          confirmLabel: "Save",
+        });
+        if (name == null) return;
+        const data = JSON.stringify(doc.board, null, 2);
+        downloadFile(`${name}.sketch`, data);
+        toast("Sketch saved");
+      },
+    },
+  );
+
+  const fileInput = h("input", {
+    type: "file",
+    accept: ".sketch",
+    style: { display: "none" },
+    onchange: (e: Event) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const board = JSON.parse(reader.result as string) as Board;
+          if (!board.id || !board.shapes || !board.edges || !board.order) {
+            toast("Invalid sketch file");
+            return;
+          }
+          actions.loadBoard(board);
+          nameInput.value = board.name;
+          fitToContent();
+          toast("Sketch loaded");
+        } catch {
+          toast("Failed to parse sketch file");
+        }
+      };
+      reader.readAsText(file);
+      (e.target as HTMLInputElement).value = "";
+    },
+  });
+
+  const openBtn = h(
+    "button",
+    {
+      class: "btn btn--icon",
+      title: "Open sketch file",
+      "aria-label": "Open sketch file",
+      html: ICON_OPEN,
+      onclick: () => fileInput.click(),
+    },
+  );
+
   const undoBtn = h("button", {
     class: "btn btn--icon",
     type: "button",
@@ -355,6 +424,8 @@ export async function mountEditor(
     settingsBtn,
     githubLink,
     skillBtn,
+    saveBtn,
+    openBtn,
     shareBtn,
   );
 
@@ -492,7 +563,7 @@ export async function mountEditor(
   };
   unsubs.push($selection.subscribe(syncStyle));
 
-  editor.append(topbar, banner, toolbar, zoombar, recenterBtn, stylePanel);
+  editor.append(topbar, banner, toolbar, zoombar, recenterBtn, stylePanel, fileInput);
   // cool cyan key-light bloom + corner vignette to seat the tabletop (topmost, no input)
   editor.appendChild(h("div", { class: "tabletop-vignette" }));
 

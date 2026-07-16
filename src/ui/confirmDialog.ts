@@ -109,6 +109,107 @@ export function confirmDialog(opts: ConfirmOptions): Promise<boolean> {
   });
 }
 
+export interface PromptOptions {
+  title: string;
+  message: string;
+  defaultValue?: string;
+  placeholder?: string;
+  confirmLabel?: string;
+  cancelLabel?: string;
+}
+
+export function promptDialog(opts: PromptOptions): Promise<string | null> {
+  const {
+    title,
+    message,
+    defaultValue = "",
+    placeholder = "",
+    confirmLabel = "Save",
+    cancelLabel = "Cancel",
+  } = opts;
+
+  return new Promise<string | null>((resolve) => {
+    let settled = false;
+
+    const finish = (result: string | null): void => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener("keydown", onKey, true);
+      backdrop.remove();
+      resolve(result);
+    };
+
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(null);
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(input.value.trim() || null);
+      }
+    };
+
+    const cancelBtn = h(
+      "button",
+      {
+        class: "confirm-dialog__btn confirm-dialog__btn--ghost",
+        type: "button",
+        onclick: () => finish(null),
+      },
+      cancelLabel,
+    );
+
+    const confirmBtn = h(
+      "button",
+      {
+        class: "confirm-dialog__btn confirm-dialog__btn--primary",
+        type: "button",
+        onclick: () => finish(input.value.trim() || null),
+      },
+      confirmLabel,
+    ) as HTMLButtonElement;
+
+    const input = h("input", {
+      class: "confirm-dialog__input",
+      type: "text",
+      value: defaultValue,
+      placeholder,
+    }) as HTMLInputElement;
+
+    const card = h(
+      "div",
+      {
+        class: "confirm-dialog__card",
+        role: "alertdialog",
+        "aria-modal": "true",
+        "aria-label": title,
+      },
+      h("h2", { class: "confirm-dialog__title" }, title),
+      h("p", { class: "confirm-dialog__message" }, message),
+      input,
+      h("div", { class: "confirm-dialog__actions" }, cancelBtn, confirmBtn),
+    );
+
+    const backdrop = h(
+      "div",
+      {
+        class: "confirm-dialog is-open",
+        onclick: (e: Event) => {
+          if (e.target === backdrop) finish(null);
+        },
+      },
+      card,
+    ) as HTMLDivElement;
+
+    document.body.appendChild(backdrop);
+    window.addEventListener("keydown", onKey, true);
+    input.focus();
+    input.select();
+  });
+}
+
 export interface ChoiceOption {
   /** Value resolved when this button is chosen. */
   id: string;

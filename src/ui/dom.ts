@@ -30,6 +30,16 @@ export function clear(el: HTMLElement): void {
   while (el.firstChild) el.removeChild(el.firstChild);
 }
 
+export function downloadFile(filename: string, data: string, mime = "application/json"): void {
+  const blob = new Blob([data], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
 export function toast(message: string): void {
   let el = document.querySelector(".toast") as HTMLDivElement | null;
